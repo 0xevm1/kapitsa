@@ -30,7 +30,7 @@ list(FILTER NI_SOURCES EXCLUDE REGEX ".*/src/server/.*")
 
 add_library(naceinfer STATIC ${NI_SOURCES} ${NI_EMBED})
 target_include_directories(naceinfer PUBLIC ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(naceinfer PUBLIC "-framework Metal" "-framework Foundation")
+target_link_libraries(naceinfer PUBLIC "-framework Metal" "-framework Foundation" "-framework CoreFoundation")
 
 file(GLOB NI_TOOLS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tools/*.cpp ${CMAKE_SOURCE_DIR}/tools/*.mm)
 foreach(t ${NI_TOOLS})
@@ -39,3 +39,7 @@ foreach(t ${NI_TOOLS})
   target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(${name} PRIVATE naceinfer)
 endforeach()
+
+add_executable(nace-infer-server ${CMAKE_SOURCE_DIR}/src/server/main.cpp)
+target_include_directories(nace-infer-server PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(nace-infer-server PRIVATE naceinfer "-framework CoreFoundation")

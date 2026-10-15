@@ -38,7 +38,9 @@ int main(int argc, char** argv) {
   }
 
   Gpu& g = Gpu::get();
-  Qwen35 m(dir, 4096);
+  Qwen35 m(dir);
+  auto seq = m.new_seq(8192);
+  Seq& s = *seq;
   SamplingParams sp;
   sp.temperature = temp;
   sp.top_p = 0.95f;
@@ -46,14 +48,14 @@ int main(int argc, char** argv) {
   sp.seed = 42;
 
   int n = int(ids.size());
-  for (int i = 0; i < n; ++i) m.tokens()[i] = ids[i];
+  for (int i = 0; i < n; ++i) s.tokens()[i] = ids[i];
 
   double t0 = now_ms();
   if (tbt) {
     // token by token through the decode path (reference for the batched prefill)
     for (int p = 0; p < n; p += 32) {
       auto e = g.begin();
-      for (int q = p; q < std::min(n, p + 32); ++q) m.encode_step(*e, q, sp, 0, q == n - 1);
+      for (int q = p; q < std::min(n, p + 32); ++q) m.encode_step(*e, s, q, sp, 0, q == n - 1);
       e->commit_and_wait();
     }
   } else {
@@ -61,7 +63,7 @@ int main(int argc, char** argv) {
     for (int p = 0; p < n; p += C) {
       int T = std::min(C, n - p);
       auto e = g.begin();
-      m.encode_prefill(*e, p, T, sp, 0, p + T == n);
+      m.encode_prefill(*e, s, p, T, sp, 0, p + T == n);
       e->commit_and_wait();
     }
   }
@@ -72,7 +74,7 @@ int main(int argc, char** argv) {
     fclose(f);
   }
   std::vector<int> out;
-  out.push_back(m.tokens()[n]);
+  out.push_back(s.tokens()[n]);
 
   // Decode: keep up to 2 command buffers in flight; the GPU writes each sampled id into the
   // token buffer, which the next step's embedding reads, so the CPU never waits per token.
@@ -83,18 +85,18 @@ int main(int argc, char** argv) {
   bool stop = false;
   double gpu_total = 0;
   int gpu_n = 0;
-  for (int s = 1; s < n_gen && !stop; ++s) {
+  for (int step = 1; step < n_gen && !stop; ++step) {
     auto e = g.begin();
-    m.encode_step(*e, pos, sp, uint32_t(s), true);
+    m.encode_step(*e, s, pos, sp, uint32_t(step), true);
     e->commit();
     inflight.push_back(std::move(e));
     ++pos;
-    while (inflight.size() > 2 || (s == n_gen - 1 && !inflight.empty())) {
+    while (inflight.size() > 2 || (step == n_gen - 1 && !inflight.empty())) {
       inflight.front()->wait();
       gpu_total += inflight.front()->gpu_ms();
       ++gpu_n;
       inflight.pop_front();
-      int tok = m.tokens()[n + done];
+      int tok = s.tokens()[n + done];
       out.push_back(tok);
       ++done;
       for (int eos : m.config().eos)
@@ -104,7 +106,7 @@ int main(int argc, char** argv) {
   while (!inflight.empty()) {
     inflight.front()->wait();
     inflight.pop_front();
-    out.push_back(m.tokens()[n + done]);
+    out.push_back(s.tokens()[n + done]);
     ++done;
   }
   double t_dec = now_ms() - t1;

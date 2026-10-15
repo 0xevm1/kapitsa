@@ -5,12 +5,13 @@
 #include <cstdio>
 using namespace ni;
 int main(int argc, char** argv) {
-  Qwen35 m(argv[1], 256);
+  Qwen35 m(argv[1]);
+  auto seq = m.new_seq(256);
   int tok = argc > 2 ? atoi(argv[2]) : 760;
-  m.tokens()[0] = tok;
+  seq->tokens()[0] = tok;
   SamplingParams sp;
   auto e = Gpu::get().begin();
-  m.encode_step(*e, 0, sp, 0, getenv("NI_DEBUG_LAYERS") == nullptr);
+  m.encode_step(*e, *seq, 0, sp, 0, getenv("NI_DEBUG_LAYERS") == nullptr);
   e->commit_and_wait();
   const float* x = m.hidden();
   int D = m.config().hidden, nan = 0;
@@ -31,6 +32,6 @@ int main(int argc, char** argv) {
   if (!getenv("NI_DEBUG_LAYERS")) {
     const float* l = m.logits();
     int best = 0; for (int i = 1; i < m.config().vocab; ++i) if (l[i] > l[best]) best = i;
-    printf("argmax=%d logit=%.4f next_tok=%d\n", best, l[best], m.tokens()[1]);
+    printf("argmax=%d logit=%.4f next_tok=%d\n", best, l[best], seq->tokens()[1]);
   }
 }

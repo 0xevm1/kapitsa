@@ -4,6 +4,7 @@
 #include "loader/safetensors.h"
 #include "metal/gpu.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,22 @@ struct Layer {
   QLinear mg, mu, md;
 };
 
+// One conversation's state: token buffer, recurrent (GDN) states, attention KV cache.
+struct Seq {
+  int cap = 0;                     // max positions
+  Buffer tok;                      // int32 [cap + 8]
+  std::vector<Buffer> conv, rec;   // per layer (linear layers only)
+  std::vector<Buffer> kc, vc;      // per layer (attention layers only), half [Hkv, cap, D]
+  int* tokens() { return tok.as<int>(); }
+};
+
+// Snapshot of a Seq's recurrent state at a position (attention KV needs no copy: entries
+// before `pos` stay valid as long as the token prefix matches).
+struct Checkpoint {
+  int pos = -1;
+  std::vector<Buffer> conv, rec;
+};
+
 struct SamplingParams {
   float temperature = 0.0f;
   float top_p = 1.0f;
@@ -61,19 +78,24 @@ struct SamplingParams {
 
 class Qwen35 {
  public:
-  explicit Qwen35(const std::string& model_dir, int max_seq = 32768, int prefill_chunk = 512);
+  explicit Qwen35(const std::string& model_dir, int prefill_chunk = 512);
   const Qwen35Config& config() const { return cfg_; }
 
+  std::unique_ptr<Seq> new_seq(int cap);
   // Clears recurrent state (KV entries are overwritten by position, so they need no reset).
-  void reset();
+  void reset(Seq& s);
+  Checkpoint new_checkpoint();
+  // GPU copies, ordered with the surrounding work in `e`.
+  void save(Encoder& e, const Seq& s, Checkpoint& c, int pos);
+  void restore(Encoder& e, Seq& s, const Checkpoint& c);
+
   // Encodes one decode step for the token at tokens[pos]. With `sample`, computes logits and
   // writes the sampled id to tokens[pos+1]; without, only advances the state (prompt tokens).
-  void encode_step(Encoder& e, int pos, const SamplingParams& sp, uint32_t step, bool sample = true);
+  void encode_step(Encoder& e, Seq& s, int pos, const SamplingParams& sp, uint32_t step, bool sample = true);
   // Encodes T prompt tokens tokens[pos0 .. pos0+T) as one batch (T <= prefill_chunk).
   // With `sample`, also samples tokens[pos0+T] from the last position.
-  void encode_prefill(Encoder& e, int pos0, int T, const SamplingParams& sp, uint32_t step, bool sample);
+  void encode_prefill(Encoder& e, Seq& s, int pos0, int T, const SamplingParams& sp, uint32_t step, bool sample);
   int prefill_chunk() const { return tmax_; }
-  int* tokens() { return tok_.as<int>(); }
   float* logits() { return logits_.as<float>(); }
   // Debug: copy of the residual stream after the last step.
   const float* hidden() { return x_.as<float>(); }
@@ -91,15 +113,16 @@ class Qwen35 {
     Buffer y;
   };
   void enc_qmv_multi(Encoder& e, std::vector<Seg> segs, const Buffer& x, const Tensor* norm);
-  void enc_gdn(Encoder& e, int li, const Layer& L);
-  void enc_attn(Encoder& e, int li, const Layer& L, int pos);
+  void enc_gdn(Encoder& e, Seq& s, int li, const Layer& L);
+  void enc_attn(Encoder& e, Seq& s, int li, const Layer& L, int pos);
   void enc_moe(Encoder& e, const Layer& L);
   // prefill
   void enc_rows_half(Encoder& e, const Buffer& x, const Tensor* norm, const Buffer& y, int T, int D);
   void enc_qmm(Encoder& e, const QLinear& L, const Buffer& xh, const Buffer& y, int M, bool add);
   void enc_qmm_moe(Encoder& e, const QLinear& L, const Buffer& xh, const Buffer& y, const Buffer& xrows,
                    const Buffer& yrows, int P, int bm);
-  void enc_sample(Encoder& e, const Buffer& xrow, int out_index, const SamplingParams& sp, uint32_t step);
+  void enc_sample(Encoder& e, Seq& s, const Buffer& xrow, int out_index, const SamplingParams& sp, uint32_t step);
+  void enc_copy(Encoder& e, const Buffer& src, const Buffer& dst);
   void enc_moe_prefill(Encoder& e, const Layer& L, int T);
 
   std::string dir_;
@@ -109,18 +132,16 @@ class Qwen35 {
   std::vector<Layer> layers_;
   const Tensor* final_norm_ = nullptr;
   QLinear embed_, lm_head_;
-  int max_seq_;
   int tmax_;
 
   // state
-  Buffer tok_, x_, logits_;
+  Buffer x_, logits_;
   Buffer qkv_, zb_, ab_, bb_, gq_, gk_, gv_, gg_, gbeta_, gout_;
   Buffer qg_, kr_, vr_, qo_, attn_out_, part_o_, part_ml_;
   Buffer rlog_, slog_, eidx_, ewts_, eh_;
   Buffer cand_v_, cand_i_, sprob_;
   // prefill-only
   Buffer xh_, hh_, ridx_, rwts_, spair_, stok_, tiles_, ntiles_, hg_, hu_, hhalf_, yd_, sgb_, sub_, ys_;
-  std::vector<Buffer> conv_state_, rec_state_, kc_, vc_;
 };
 
 } // namespace ni

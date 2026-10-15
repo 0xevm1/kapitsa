@@ -33,3 +33,9 @@ NI_INLINE float tg_max(float v, threadgroup float* scratch, uint tid, uint ntg) 
   threadgroup_barrier(mem_flags::mem_threadgroup);
   return r;
 }
+
+// ---- misc ----
+[[kernel]] void copy_u32(const device uint4* src [[buffer(0)]], device uint4* dst [[buffer(1)]],
+                         constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i < n) dst[i] = src[i];
+}
