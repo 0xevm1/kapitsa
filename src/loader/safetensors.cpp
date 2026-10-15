@@ -1,0 +1,157 @@
+#include "loader/safetensors.h"
+#include "util/log.h"
+
+#include <nlohmann/json.hpp>
+
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <thread>
+
+namespace ni {
+
+size_t dtype_size(DType d) {
+  switch (d) {
+    case DType::F32: case DType::U32: case DType::I32: return 4;
+    case DType::F16: case DType::BF16: return 2;
+    case DType::U8: case DType::I8: return 1;
+    case DType::I64: return 8;
+    default: return 0;
+  }
+}
+
+static DType parse_dtype(const std::string& s) {
+  if (s == "F32") return DType::F32;
+  if (s == "F16") return DType::F16;
+  if (s == "BF16") return DType::BF16;
+  if (s == "U32") return DType::U32;
+  if (s == "I32") return DType::I32;
+  if (s == "U8") return DType::U8;
+  if (s == "I8") return DType::I8;
+  if (s == "I64") return DType::I64;
+  return DType::Unknown;
+}
+
+namespace {
+struct ReadJob {
+  int fd;
+  size_t file_off;
+  uint8_t* dst;
+  size_t len;
+};
+} // namespace
+
+void WeightStore::open_dir(const std::string& dir, const Filter& keep) {
+  DIR* d = opendir(dir.c_str());
+  if (!d) fatal("cannot open model dir %s", dir.c_str());
+  std::vector<std::string> files;
+  while (dirent* e = readdir(d)) {
+    std::string n = e->d_name;
+    if (n.size() > 12 && n.substr(n.size() - 12) == ".safetensors") files.push_back(dir + "/" + n);
+  }
+  closedir(d);
+  std::sort(files.begin(), files.end());
+  if (files.empty()) fatal("no .safetensors in %s", dir.c_str());
+
+  constexpr size_t kAlign = 256, kChunk = 32u << 20;
+  std::vector<ReadJob> jobs;
+  std::vector<int> fds;
+  for (auto& path : files) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) fatal("open %s failed", path.c_str());
+    fcntl(fd, F_NOCACHE, 1); // stream once; don't keep a second copy in the page cache
+    uint64_t hlen = 0;
+    if (pread(fd, &hlen, 8, 0) != 8) fatal("read %s failed", path.c_str());
+    std::string hdr(hlen, '\0');
+    if (pread(fd, hdr.data(), hlen, 8) != ssize_t(hlen)) fatal("read %s header failed", path.c_str());
+    auto j = nlohmann::json::parse(hdr);
+    size_t data0 = 8 + hlen;
+
+    struct Item {
+      std::string name;
+      Tensor t;
+      size_t src, len, dst;
+    };
+    std::vector<Item> items;
+    size_t total = 0;
+    for (auto& [name, v] : j.items()) {
+      if (name == "__metadata__") continue;
+      if (keep && !keep(name)) continue;
+      Item it;
+      it.name = name;
+      it.t.dtype = parse_dtype(v["dtype"].get<std::string>());
+      for (auto& s : v["shape"]) it.t.shape.push_back(s.get<int64_t>());
+      size_t b = v["data_offsets"][0].get<size_t>(), e = v["data_offsets"][1].get<size_t>();
+      it.src = data0 + b;
+      it.len = e - b;
+      it.dst = total;
+      total += (it.len + kAlign - 1) / kAlign * kAlign;
+      items.push_back(std::move(it));
+    }
+    if (items.empty()) {
+      close(fd);
+      continue;
+    }
+    // Read in file order for sequential I/O.
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.src < b.src; });
+    std::string base = path.substr(path.find_last_of('/') + 1);
+    Buffer fb = Gpu::get().alloc(total, base.c_str(), /*tracked=*/false);
+    files_.push_back(fb);
+    total_ += total;
+    fds.push_back(fd);
+    for (auto& it : items) {
+      it.t.buf = fb.view(it.dst, it.len);
+      for (size_t o = 0; o < it.len; o += kChunk)
+        jobs.push_back({fd, it.src + o, fb.as<uint8_t>() + it.dst + o, std::min(kChunk, it.len - o)});
+      tensors_[it.name] = it.t;
+    }
+  }
+
+  double t0 = now_ms();
+  std::atomic<size_t> next{0};
+  std::atomic<bool> failed{false};
+  unsigned nth = std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
+  std::vector<std::thread> th;
+  for (unsigned i = 0; i < nth; ++i)
+    th.emplace_back([&] {
+      for (size_t k; (k = next.fetch_add(1)) < jobs.size();) {
+        const ReadJob& jb = jobs[k];
+        size_t done = 0;
+        while (done < jb.len) {
+          ssize_t r = pread(jb.fd, jb.dst + done, jb.len - done, off_t(jb.file_off + done));
+          if (r <= 0) {
+            failed = true;
+            return;
+          }
+          done += size_t(r);
+        }
+      }
+    });
+  for (auto& t : th) t.join();
+  for (int fd : fds) close(fd);
+  if (failed) fatal("reading weights from %s failed", dir.c_str());
+  double ms = now_ms() - t0;
+  logi("read %.2f GB of weights in %.0f ms (%.1f GB/s)", total_ / 1e9, ms, total_ / 1e6 / ms);
+}
+
+const Tensor* WeightStore::find(const std::string& name) const {
+  auto it = tensors_.find(name);
+  return it == tensors_.end() ? nullptr : &it->second;
+}
+
+const Tensor& WeightStore::get(const std::string& name) const {
+  auto* t = find(name);
+  if (!t) fatal("missing tensor %s", name.c_str());
+  return *t;
+}
+
+WeightStore::~WeightStore() {
+  for (auto& b : files_) Gpu::get().release(b);
+}
+
+} // namespace ni

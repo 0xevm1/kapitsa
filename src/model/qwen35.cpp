@@ -1,0 +1,424 @@
+#include "model/qwen35.h"
+#include "model/kparams.h"
+#include "util/log.h"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <unordered_map>
+
+namespace ni {
+
+using json = nlohmann::json;
+
+static json read_json(const std::string& path) {
+  std::ifstream f(path);
+  if (!f) fatal("cannot read %s", path.c_str());
+  return json::parse(f);
+}
+
+static json quant_cfg_;
+
+void Qwen35::load_config(const std::string& dir) {
+  json root = read_json(dir + "/config.json");
+  json t = root.contains("text_config") ? root["text_config"] : root;
+  quant_cfg_ = root.contains("quantization") ? root["quantization"] : json::object();
+  cfg_.group_size = quant_cfg_.value("group_size", 64);
+  cfg_.hidden = t["hidden_size"];
+  cfg_.layers = t["num_hidden_layers"];
+  cfg_.vocab = t["vocab_size"];
+  cfg_.eps = t.value("rms_norm_eps", 1e-6f);
+  cfg_.lin_hk = t["linear_num_key_heads"];
+  cfg_.lin_hv = t["linear_num_value_heads"];
+  cfg_.lin_dk = t["linear_key_head_dim"];
+  cfg_.lin_dv = t["linear_value_head_dim"];
+  cfg_.conv_k = t.value("linear_conv_kernel_dim", 4);
+  cfg_.hq = t["num_attention_heads"];
+  cfg_.hkv = t["num_key_value_heads"];
+  cfg_.head_dim = t.value("head_dim", cfg_.hidden / cfg_.hq);
+  float prf = 0.25f;
+  if (t.contains("rope_parameters")) {
+    auto& rp = t["rope_parameters"];
+    cfg_.theta = rp.value("rope_theta", 1e7f);
+    prf = rp.value("partial_rotary_factor", 0.25f);
+  } else {
+    cfg_.theta = t.value("rope_theta", 1e7f);
+    prf = t.value("partial_rotary_factor", 0.25f);
+  }
+  cfg_.rot_dims = int(cfg_.head_dim * prf);
+  int interval = t.value("full_attention_interval", 4);
+  cfg_.is_linear.resize(cfg_.layers);
+  if (t.contains("layer_types") && t["layer_types"].is_array()) {
+    for (int i = 0; i < cfg_.layers; ++i) cfg_.is_linear[i] = t["layer_types"][i] == "linear_attention";
+  } else {
+    for (int i = 0; i < cfg_.layers; ++i) cfg_.is_linear[i] = (i + 1) % interval != 0;
+  }
+  cfg_.experts = t.value("num_experts", 0);
+  cfg_.moe = cfg_.experts > 0;
+  cfg_.top_k = t.value("num_experts_per_tok", 0);
+  cfg_.moe_I = t.value("moe_intermediate_size", 0);
+  cfg_.shared_I = t.value("shared_expert_intermediate_size", 0);
+  cfg_.dense_I = t.value("intermediate_size", 0);
+  cfg_.norm_topk = t.value("norm_topk_prob", true);
+  auto eos = root.contains("eos_token_id") ? root["eos_token_id"] : t["eos_token_id"];
+  if (eos.is_array())
+    for (auto& e : eos) cfg_.eos.push_back(e);
+  else
+    cfg_.eos.push_back(eos);
+}
+
+QLinear Qwen35::qlin(const std::string& name, bool required) {
+  QLinear L;
+  std::string full = prefix_ + name;
+  L.w = ws_.find(full + ".weight");
+  if (!L.w) {
+    if (required) fatal("missing %s.weight", full.c_str());
+    return L;
+  }
+  L.s = ws_.find(full + ".scales");
+  L.b = ws_.find(full + ".biases");
+  if (!L.s || !L.b) fatal("%s is not MLX affine-quantized (bf16 linears not supported yet)", full.c_str());
+  int bits = quant_cfg_.value("bits", 4), gs = quant_cfg_.value("group_size", 64);
+  // per-module overrides are keyed by the module path without ".weight"
+  for (auto key : {full, name}) {
+    if (quant_cfg_.contains(key) && quant_cfg_[key].is_object()) {
+      bits = quant_cfg_[key].value("bits", bits);
+      gs = quant_cfg_[key].value("group_size", gs);
+    }
+  }
+  L.bits = bits;
+  L.gs = gs;
+  int64_t words = L.w->shape.back();
+  L.K = uint32_t(words * 32 / bits);
+  L.N = uint32_t(L.w->shape[L.w->shape.size() - 2]);
+  if (int64_t(L.K / gs) != L.s->shape.back()) fatal("%s: bits/group mismatch", full.c_str());
+  return L;
+}
+
+Qwen35::Qwen35(const std::string& dir, int max_seq) : dir_(dir), max_seq_(max_seq) {
+  double t0 = now_ms();
+  load_config(dir);
+  // Text-only engine for now: skip the vision tower and (until speculative decoding lands) MTP.
+  ws_.open_dir(dir, [](const std::string& n) {
+    return n.find("vision_tower") == std::string::npos && n.find("visual.") == std::string::npos &&
+           n.rfind("mtp.", 0) != 0;
+  });
+  if (ws_.has("language_model.model.embed_tokens.weight")) prefix_ = "language_model.";
+  else if (ws_.has("model.embed_tokens.weight")) prefix_ = "";
+  else fatal("unrecognized weight naming");
+
+  embed_ = qlin("model.embed_tokens");
+  lm_head_ = qlin("lm_head");
+  final_norm_ = &ws_.get(prefix_ + "model.norm.weight");
+  layers_.resize(cfg_.layers);
+  for (int i = 0; i < cfg_.layers; ++i) {
+    Layer& L = layers_[i];
+    std::string p = "model.layers." + std::to_string(i) + ".";
+    L.linear = cfg_.is_linear[i];
+    L.in_norm = &ws_.get(prefix_ + p + "input_layernorm.weight");
+    L.post_norm = &ws_.get(prefix_ + p + "post_attention_layernorm.weight");
+    if (L.linear) {
+      std::string a = p + "linear_attn.";
+      L.qkv = qlin(a + "in_proj_qkv");
+      L.z = qlin(a + "in_proj_z");
+      L.a = qlin(a + "in_proj_a");
+      L.b = qlin(a + "in_proj_b");
+      L.out = qlin(a + "out_proj");
+      L.conv_w = &ws_.get(prefix_ + a + "conv1d.weight");
+      L.A_log = &ws_.get(prefix_ + a + "A_log");
+      L.dt_bias = &ws_.get(prefix_ + a + "dt_bias");
+      L.gnorm = &ws_.get(prefix_ + a + "norm.weight");
+    } else {
+      std::string a = p + "self_attn.";
+      L.q = qlin(a + "q_proj");
+      L.k = qlin(a + "k_proj");
+      L.v = qlin(a + "v_proj");
+      L.o = qlin(a + "o_proj");
+      L.q_norm = &ws_.get(prefix_ + a + "q_norm.weight");
+      L.k_norm = &ws_.get(prefix_ + a + "k_norm.weight");
+    }
+    if (cfg_.moe) {
+      std::string m = p + "mlp.";
+      L.router = qlin(m + "gate");
+      L.shared_gate = qlin(m + "shared_expert_gate");
+      L.eg = qlin(m + "switch_mlp.gate_proj");
+      L.eu = qlin(m + "switch_mlp.up_proj");
+      L.ed = qlin(m + "switch_mlp.down_proj");
+      L.sg = qlin(m + "shared_expert.gate_proj");
+      L.su = qlin(m + "shared_expert.up_proj");
+      L.sd = qlin(m + "shared_expert.down_proj");
+    } else {
+      std::string m = p + "mlp.";
+      L.mg = qlin(m + "gate_proj");
+      L.mu = qlin(m + "up_proj");
+      L.md = qlin(m + "down_proj");
+    }
+  }
+  // Checks the kernels' assumptions.
+  if (cfg_.lin_dk != 128 || cfg_.lin_dv != 128) fatal("GDN head dims must be 128");
+  if (cfg_.head_dim != 256) fatal("attention head_dim must be 256");
+  if (cfg_.hq / cfg_.hkv > 8) fatal("GQA ratio > 8 unsupported");
+  if (cfg_.conv_k != 4) fatal("conv kernel must be 4");
+  if (cfg_.moe && (cfg_.moe_I % 512 || cfg_.shared_I % 512)) fatal("expert sizes must be multiples of 512");
+  if (embed_.bits != 4) fatal("embedding must be 4-bit");
+
+  Gpu::get().make_resident(ws_.buffers());
+  alloc_state();
+  logi("loaded %s: %d layers, %s, %.1f GB mapped in %.0f ms", dir.c_str(), cfg_.layers,
+       cfg_.moe ? "MoE" : "dense", ws_.total_bytes() / 1e9, now_ms() - t0);
+}
+
+void Qwen35::alloc_state() {
+  Gpu& g = Gpu::get();
+  const int D = cfg_.hidden;
+  const int T = 1; // decode path; prefill buffers are sized separately later
+  const int C = 2 * cfg_.lin_hk * cfg_.lin_dk + cfg_.lin_hv * cfg_.lin_dv;
+  const int VD = cfg_.lin_hv * cfg_.lin_dv;
+  tok_ = g.alloc(size_t(max_seq_ + 8) * 4, "tokens");
+  x_ = g.alloc(size_t(T) * D * 4, "x");
+  logits_ = g.alloc(size_t(cfg_.vocab) * 4, "logits");
+  qkv_ = g.alloc(size_t(T) * C * 4);
+  zb_ = g.alloc(size_t(T) * VD * 4);
+  ab_ = g.alloc(size_t(T) * cfg_.lin_hv * 4);
+  bb_ = g.alloc(size_t(T) * cfg_.lin_hv * 4);
+  gq_ = g.alloc(size_t(T) * cfg_.lin_hk * cfg_.lin_dk * 4);
+  gk_ = g.alloc(size_t(T) * cfg_.lin_hk * cfg_.lin_dk * 4);
+  gv_ = g.alloc(size_t(T) * VD * 4);
+  gg_ = g.alloc(size_t(T) * cfg_.lin_hv * 4);
+  gbeta_ = g.alloc(size_t(T) * cfg_.lin_hv * 4);
+  gout_ = g.alloc(size_t(T) * VD * 4);
+  qg_ = g.alloc(size_t(T) * cfg_.hq * cfg_.head_dim * 2 * 4);
+  kr_ = g.alloc(size_t(T) * cfg_.hkv * cfg_.head_dim * 4);
+  vr_ = g.alloc(size_t(T) * cfg_.hkv * cfg_.head_dim * 4);
+  qo_ = g.alloc(size_t(T) * cfg_.hq * cfg_.head_dim * 4);
+  attn_out_ = g.alloc(size_t(T) * cfg_.hq * cfg_.head_dim * 4);
+  const int max_chunks = 1024;
+  part_o_ = g.alloc(size_t(cfg_.hq) * max_chunks * cfg_.head_dim * 4);
+  part_ml_ = g.alloc(size_t(cfg_.hq) * max_chunks * 2 * 4);
+  rlog_ = g.alloc(size_t(std::max(cfg_.experts, 1)) * 4);
+  slog_ = g.alloc(16);
+  eidx_ = g.alloc(64 * 4);
+  ewts_ = g.alloc(64 * 4);
+  eh_ = g.alloc(size_t(cfg_.top_k + 1) * std::max(cfg_.moe_I, cfg_.shared_I) * 4 + 16);
+  cand_v_ = g.alloc(size_t(cfg_.vocab / 2048 + 2) * 64 * 4);
+  cand_i_ = g.alloc(size_t(cfg_.vocab / 2048 + 2) * 64 * 4);
+  sprob_ = g.alloc(64 * 4);
+  size_t state_bytes = 0;
+  for (int i = 0; i < cfg_.layers; ++i) {
+    if (cfg_.is_linear[i]) {
+      conv_state_.push_back(g.alloc(size_t(3) * C * 4, "conv_state"));
+      rec_state_.push_back(g.alloc(size_t(cfg_.lin_hv) * cfg_.lin_dv * cfg_.lin_dk * 4, "gdn_state"));
+      kc_.push_back(Buffer{});
+      vc_.push_back(Buffer{});
+      state_bytes += size_t(3) * C * 4 + size_t(cfg_.lin_hv) * cfg_.lin_dv * cfg_.lin_dk * 4;
+    } else {
+      size_t kvb = size_t(cfg_.hkv) * max_seq_ * cfg_.head_dim * 2;
+      conv_state_.push_back(Buffer{});
+      rec_state_.push_back(Buffer{});
+      kc_.push_back(g.alloc(kvb, "k_cache"));
+      vc_.push_back(g.alloc(kvb, "v_cache"));
+      state_bytes += 2 * kvb;
+    }
+  }
+  logi("state: %.0f MB (KV for %d tokens)", state_bytes / 1e6, max_seq_);
+  reset();
+}
+
+void Qwen35::reset() {
+  for (auto& b : conv_state_)
+    if (b) memset(b.ptr(), 0, b.size);
+  for (auto& b : rec_state_)
+    if (b) memset(b.ptr(), 0, b.size);
+}
+
+// ---- encoders ----
+static constexpr uint32_t kRows = 4, kSg = 2; // qmv: rows per simdgroup, simdgroups per threadgroup
+
+void Qwen35::enc_qmv(Encoder& e, const QLinear& L, const Buffer& x, const Buffer& y, const Buffer* resid,
+                     const Tensor* norm) {
+  std::string name = "qmv_b" + std::to_string(L.bits) + "_g" + std::to_string(L.gs) + "_v16_r4_t1";
+  if (resid) name += "_add";
+  if (norm) name += "_norm";
+  static std::unordered_map<std::string, Pipeline> cache;
+  auto it = cache.find(name);
+  if (it == cache.end()) it = cache.emplace(name, Gpu::get().pipeline(name)).first;
+  e.use(it->second);
+  kp::Qmv p{L.N, L.K, L.K, L.N, cfg_.eps};
+  e.buf(0, L.w->buf);
+  e.buf(1, L.s->buf);
+  e.buf(2, L.b->buf);
+  e.buf(3, x);
+  e.buf(4, y);
+  e.val(5, p);
+  e.buf(6, resid ? *resid : y);
+  e.buf(7, norm ? norm->buf : y);
+  e.dispatch((L.N + kRows * kSg - 1) / (kRows * kSg), 1, 1, 32 * kSg);
+}
+
+void Qwen35::enc_qmv_multi(Encoder& e, std::vector<Seg> segs, const Buffer& x, const Tensor* norm) {
+  static Pipeline pn = Gpu::get().pipeline("qmv_multi_g64_v16_r4_norm");
+  static Pipeline pp = Gpu::get().pipeline("qmv_multi_g64_v16_r4");
+  e.use(norm ? pn : pp);
+  kp::QmvMulti p{};
+  p.K = segs[0].L->K;
+  p.nseg = uint32_t(segs.size());
+  p.eps = cfg_.eps;
+  uint32_t tg = 0;
+  for (size_t i = 0; i < 4; ++i) {
+    const Seg& s = segs[std::min(i, segs.size() - 1)];
+    if (i < segs.size()) {
+      if (s.L->K != p.K || s.L->gs != 64) fatal("qmv_multi: segments must share K and group 64");
+      p.N[i] = s.L->N;
+      p.bits[i] = uint32_t(s.L->bits);
+      p.tg_begin[i] = tg;
+      tg += (s.L->N + kRows * kSg - 1) / (kRows * kSg);
+    }
+    e.buf(int(i * 4 + 0), s.L->w->buf);
+    e.buf(int(i * 4 + 1), s.L->s->buf);
+    e.buf(int(i * 4 + 2), s.L->b->buf);
+    e.buf(int(i * 4 + 3), s.y);
+  }
+  p.tg_begin[segs.size()] = tg;
+  e.buf(16, x);
+  e.val(17, p);
+  e.buf(18, norm ? norm->buf : x);
+  e.dispatch(tg, 1, 1, 32 * kSg);
+}
+
+void Qwen35::enc_gdn(Encoder& e, int li, const Layer& L) {
+  static Pipeline prep = Gpu::get().pipeline("gdn_prep");
+  static Pipeline step = Gpu::get().pipeline("gdn_step");
+  enc_qmv_multi(e, {{&L.qkv, qkv_}, {&L.z, zb_}, {&L.b, bb_}, {&L.a, ab_}}, x_, L.in_norm);
+  const uint32_t C = 2 * cfg_.lin_hk * cfg_.lin_dk + cfg_.lin_hv * cfg_.lin_dv;
+  kp::GdnPrep pp{1, uint32_t(cfg_.lin_hk), uint32_t(cfg_.lin_hv), C};
+  e.use(prep);
+  e.buf(0, qkv_); e.buf(1, ab_); e.buf(2, bb_); e.buf(3, conv_state_[li]);
+  e.buf(4, L.conv_w->buf); e.buf(5, L.A_log->buf); e.buf(6, L.dt_bias->buf);
+  e.buf(7, gq_); e.buf(8, gk_); e.buf(9, gv_); e.buf(10, gg_); e.buf(11, gbeta_);
+  e.val(12, pp);
+  e.dispatch(C / 128, 1, 1, 128);
+  kp::GdnStep sp{1, uint32_t(cfg_.lin_hk), uint32_t(cfg_.lin_hv), cfg_.eps};
+  e.use(step);
+  e.buf(0, gq_); e.buf(1, gk_); e.buf(2, gv_); e.buf(3, gg_); e.buf(4, gbeta_);
+  e.buf(5, rec_state_[li]); e.buf(6, zb_); e.buf(7, L.gnorm->buf); e.buf(8, gout_);
+  e.val(9, sp);
+  e.dispatch(cfg_.lin_hv, 1, 1, 1024);
+  enc_qmv(e, L.out, gout_, x_, &x_, nullptr);
+}
+
+void Qwen35::enc_attn(Encoder& e, int li, const Layer& L, int pos) {
+  static Pipeline prep = Gpu::get().pipeline("attn_prep");
+  static Pipeline part = Gpu::get().pipeline("attn_decode_partial");
+  static Pipeline red = Gpu::get().pipeline("attn_decode_reduce");
+  enc_qmv_multi(e, {{&L.q, qg_}, {&L.k, kr_}, {&L.v, vr_}}, x_, L.in_norm);
+  kp::AttnPrep ap{1, uint32_t(cfg_.hq), uint32_t(cfg_.hkv), uint32_t(cfg_.head_dim), uint32_t(cfg_.rot_dims),
+                  uint32_t(pos), uint32_t(max_seq_), cfg_.eps, cfg_.theta};
+  e.use(prep);
+  e.buf(0, qg_); e.buf(1, kr_); e.buf(2, vr_); e.buf(3, L.q_norm->buf); e.buf(4, L.k_norm->buf);
+  e.buf(5, qo_); e.buf(6, kc_[li]); e.buf(7, vc_[li]);
+  e.val(8, ap);
+  e.dispatch(cfg_.hq + 2 * cfg_.hkv, 1, 1, cfg_.head_dim);
+
+  const uint32_t Lk = uint32_t(pos + 1);
+  // aim for >= ~40 threadgroups overall, chunks of at least 64 positions
+  uint32_t chunk = std::max<uint32_t>(64, (Lk + 19) / 20);
+  chunk = (chunk + 15) / 16 * 16;
+  uint32_t nch = (Lk + chunk - 1) / chunk;
+  kp::AttnDec dp{uint32_t(cfg_.hq), uint32_t(cfg_.hkv), Lk, chunk, uint32_t(max_seq_),
+                 1.0f / std::sqrt(float(cfg_.head_dim)), nch};
+  e.use(part);
+  e.buf(0, qo_); e.buf(1, kc_[li]); e.buf(2, vc_[li]); e.buf(3, part_o_); e.buf(4, part_ml_);
+  e.val(5, dp);
+  e.dispatch(nch, cfg_.hkv, 1, 32 * (cfg_.hq / cfg_.hkv));
+  e.use(red);
+  e.buf(0, part_o_); e.buf(1, part_ml_); e.buf(2, qg_); e.buf(3, attn_out_);
+  e.val(4, dp);
+  e.dispatch(cfg_.hq, 1, 1, cfg_.head_dim);
+  enc_qmv(e, L.o, attn_out_, x_, &x_, nullptr);
+}
+
+void Qwen35::enc_moe(Encoder& e, const Layer& L) {
+  static Pipeline topk = Gpu::get().pipeline("moe_topk");
+  static Pipeline gu = Gpu::get().pipeline("moe_gate_up");
+  static Pipeline dn = Gpu::get().pipeline("moe_down");
+  enc_qmv_multi(e, {{&L.router, rlog_}, {&L.shared_gate, slog_}}, x_, L.post_norm);
+  kp::Topk tp{uint32_t(cfg_.experts), uint32_t(cfg_.top_k), cfg_.norm_topk ? 1u : 0u};
+  e.use(topk);
+  e.buf(0, rlog_); e.buf(1, slog_); e.buf(2, eidx_); e.buf(3, ewts_);
+  e.val(4, tp);
+  e.dispatch(1, 1, 1, 32);
+  kp::Moe mp{uint32_t(cfg_.hidden), uint32_t(cfg_.moe_I), uint32_t(cfg_.shared_I), uint32_t(cfg_.top_k), cfg_.eps};
+  e.use(gu);
+  e.buf(0, L.eg.w->buf); e.buf(1, L.eg.s->buf); e.buf(2, L.eg.b->buf);
+  e.buf(3, L.eu.w->buf); e.buf(4, L.eu.s->buf); e.buf(5, L.eu.b->buf);
+  e.buf(6, L.sg.w->buf); e.buf(7, L.sg.s->buf); e.buf(8, L.sg.b->buf);
+  e.buf(9, L.su.w->buf); e.buf(10, L.su.s->buf); e.buf(11, L.su.b->buf);
+  e.buf(12, x_); e.buf(13, L.post_norm->buf); e.buf(14, eidx_); e.buf(15, eh_);
+  e.val(16, mp);
+  uint32_t rows = uint32_t(std::max(cfg_.moe_I, cfg_.shared_I));
+  e.dispatch((rows + kRows * kSg - 1) / (kRows * kSg), cfg_.top_k + 1, 1, 32 * kSg);
+  e.use(dn);
+  e.buf(0, L.ed.w->buf); e.buf(1, L.ed.s->buf); e.buf(2, L.ed.b->buf);
+  e.buf(3, L.sd.w->buf); e.buf(4, L.sd.s->buf); e.buf(5, L.sd.b->buf);
+  e.buf(6, eh_); e.buf(7, eidx_); e.buf(8, ewts_); e.buf(9, x_);
+  e.val(10, mp);
+  e.dispatch((cfg_.hidden + kRows * kSg - 1) / (kRows * kSg), 1, 1, 32 * kSg);
+}
+
+void Qwen35::encode_step(Encoder& e, int pos, const SamplingParams& sp, uint32_t step, bool sample) {
+  static Pipeline emb = Gpu::get().pipeline("embed_q4");
+  static Pipeline st1 = Gpu::get().pipeline("topk_stage1");
+  static Pipeline st2 = Gpu::get().pipeline("sample_stage2");
+  if (pos + 1 >= max_seq_) fatal("context full (%d)", max_seq_);
+  kp::Embed ep{uint32_t(cfg_.hidden), uint32_t(embed_.gs), uint32_t(pos)};
+  e.use(emb);
+  e.buf(0, embed_.w->buf); e.buf(1, embed_.s->buf); e.buf(2, embed_.b->buf); e.buf(3, tok_); e.buf(4, x_);
+  e.val(5, ep);
+  e.dispatch((cfg_.hidden / 8 + 63) / 64, 1, 1, 64);
+  static int dbg_layers = getenv("NI_DEBUG_LAYERS") ? atoi(getenv("NI_DEBUG_LAYERS")) : -1;
+  for (int i = 0; i < cfg_.layers; ++i) {
+    if (i == dbg_layers) return;
+    const Layer& L = layers_[i];
+    if (L.linear) enc_gdn(e, i, L);
+    else enc_attn(e, i, L, pos);
+    if (i + 1 == dbg_layers && getenv("NI_DEBUG_HALF")) return;
+    if (cfg_.moe) enc_moe(e, L);
+    else fatal("dense MLP not implemented yet");
+  }
+  if (!sample) return;
+  enc_qmv(e, lm_head_, x_, logits_, nullptr, final_norm_);
+  // stage 2 holds 4 candidates per thread (4096): 122 threadgroups x 32 fits
+  uint32_t K = sp.temperature > 0 ? uint32_t(std::clamp(sp.top_k <= 0 ? 32 : sp.top_k, 1, 32)) : 1u;
+  kp::TopkStage ts{uint32_t(cfg_.vocab), K, 2048};
+  uint32_t ntg = (cfg_.vocab + 2047) / 2048;
+  e.use(st1);
+  e.buf(0, logits_); e.buf(1, cand_v_); e.buf(2, cand_i_);
+  e.val(3, ts);
+  e.dispatch(ntg, 1, 1, 256);
+  kp::Sample sp2{ntg * K, K, sp.temperature, sp.top_p, sp.seed, step, uint32_t(pos + 1)};
+  e.use(st2);
+  e.buf(0, cand_v_); e.buf(1, cand_i_); e.buf(2, tok_); e.buf(3, sprob_);
+  e.val(4, sp2);
+  e.dispatch(1, 1, 1, 1024);
+}
+
+Buffer Qwen35::debug_buf(const std::string& n) {
+  if (n == "rlog") return rlog_;
+  if (n == "slog") return slog_;
+  if (n == "eidx") return eidx_;
+  if (n == "ewts") return ewts_;
+  if (n == "eh") return eh_;
+  if (n == "gout") return gout_;
+  if (n == "qkv") return qkv_;
+  if (n == "gq") return gq_;
+  if (n == "gv") return gv_;
+  if (n == "gg") return gg_;
+  if (n == "gbeta") return gbeta_;
+  if (n == "zb") return zb_;
+  return x_;
+}
+
+} // namespace ni

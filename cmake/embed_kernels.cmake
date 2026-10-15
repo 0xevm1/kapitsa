@@ -1,0 +1,15 @@
+# Concatenates src/kernels/common.h + every *.metal into one C++ string literal.
+file(READ ${SRC_DIR}/common.h COMMON)
+file(READ ${SRC_DIR}/quant.h QUANT)
+string(APPEND COMMON "\n${QUANT}")
+file(GLOB METALS ${SRC_DIR}/*.metal)
+list(SORT METALS)
+set(ALL "${COMMON}\n")
+foreach(m ${METALS})
+  file(READ ${m} BODY)
+  string(REGEX REPLACE "#include \"common.h\"" "" BODY "${BODY}")
+  get_filename_component(n ${m} NAME)
+  string(APPEND ALL "\n// ---- ${n} ----\n${BODY}\n")
+endforeach()
+# Split into chunks: MSVC-style literal limits don't apply to clang, but keep delimiters unique.
+file(WRITE ${OUT} "// generated\nnamespace ni { extern const char* const kKernelSource; const char* const kKernelSource = R\"NIKERNEL(${ALL})NIKERNEL\"; }\n")
