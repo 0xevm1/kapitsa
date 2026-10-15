@@ -4,6 +4,8 @@
 #include "metal/gpu.h"
 #include "util/log.h"
 
+#include <algorithm>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 
@@ -103,7 +105,7 @@ Pipeline Gpu::pipeline(const std::string& fn) {
     NSError* err = nil;
     id<MTLComputePipelineState> pso = [dev(device_) newComputePipelineStateWithFunction:f error:&err];
     if (!pso) fatal("pipeline %s: %s", fn.c_str(), [[err description] UTF8String]);
-    Pipeline p{(__bridge_retained void*)pso, (uint32_t)pso.maxTotalThreadsPerThreadgroup,
+    Pipeline p{(__bridge_retained void*)pso, strdup(fn.c_str()), (uint32_t)pso.maxTotalThreadsPerThreadgroup,
                (uint32_t)pso.threadExecutionWidth};
     std::lock_guard<std::mutex> lk(impl_->mu);
     impl_->pipelines[fn] = p;
@@ -119,6 +121,7 @@ std::unique_ptr<Encoder> Gpu::begin(bool concurrent) {
       [cb computeCommandEncoderWithDispatchType:concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
   e->cb_ = (__bridge_retained void*)cb;
   e->enc_ = (__bridge_retained void*)enc;
+  e->concurrent_ = concurrent;
   return e;
 }
 
@@ -146,7 +149,46 @@ void Gpu::make_resident(const std::vector<Buffer>& bufs) {
 // ---- Encoder ----
 static inline id<MTLComputeCommandEncoder> E(void* p) { return (__bridge id<MTLComputeCommandEncoder>)p; }
 
-void Encoder::use(const Pipeline& p) { [E(enc_) setComputePipelineState:(__bridge id<MTLComputePipelineState>)p.pso]; }
+void Encoder::use(const Pipeline& p) {
+  [E(enc_) setComputePipelineState:(__bridge id<MTLComputePipelineState>)p.pso];
+  cur_name_ = p.name;
+}
+
+namespace {
+struct ProfRec {
+  const char* name;
+  id<MTLCommandBuffer> cb;
+};
+std::vector<ProfRec>& prof_recs() {
+  static std::vector<ProfRec> v;
+  return v;
+}
+} // namespace
+
+bool Encoder::profiling() {
+  static bool on = getenv("NI_PROFILE") && atoi(getenv("NI_PROFILE")) > 0;
+  return on;
+}
+
+void Encoder::profile_report(int steps) {
+  std::map<std::string, std::pair<double, int>> agg;
+  double total = 0;
+  for (auto& r : prof_recs()) {
+    [r.cb waitUntilCompleted];
+    double ms = (r.cb.GPUEndTime - r.cb.GPUStartTime) * 1000.0;
+    agg[r.name].first += ms;
+    agg[r.name].second += 1;
+    total += ms;
+  }
+  std::vector<std::pair<std::string, std::pair<double, int>>> v(agg.begin(), agg.end());
+  std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.first > b.second.first; });
+  fprintf(stderr, "---- GPU profile per step (%d steps, %.3f ms/step total, isolated dispatches) ----\n", steps,
+          total / steps);
+  for (auto& [n, p] : v)
+    fprintf(stderr, "  %-28s %8.3f ms/step  %5.1f%%  %6.1f calls/step  %7.2f us/call\n", n.c_str(), p.first / steps,
+            100 * p.first / total, double(p.second) / steps, 1000 * p.first / p.second);
+  prof_recs().clear();
+}
 void Encoder::buf(int idx, const Buffer& b, size_t extra) {
   [E(enc_) setBuffer:(__bridge id<MTLBuffer>)b.mtl offset:b.offset + extra atIndex:idx];
 }
@@ -154,6 +196,21 @@ void Encoder::bytes(int idx, const void* data, size_t len) { [E(enc_) setBytes:d
 void Encoder::tgmem(int idx, size_t len) { [E(enc_) setThreadgroupMemoryLength:(len + 15) & ~size_t(15) atIndex:idx]; }
 void Encoder::dispatch(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t tx, uint32_t ty, uint32_t tz) {
   [E(enc_) dispatchThreadgroups:MTLSizeMake(gx, gy, gz) threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
+  if (profiling()) {
+    // close this dispatch into its own command buffer and continue in a fresh one
+    [E(enc_) endEncoding];
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)cb_;
+    [cb commit];
+    prof_recs().push_back({cur_name_, cb});
+    CFRelease(enc_);
+    CFRelease(cb_);
+    id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)Gpu::get().queue();
+    id<MTLCommandBuffer> nb = [q commandBufferWithUnretainedReferences];
+    id<MTLComputeCommandEncoder> ne =
+        [nb computeCommandEncoderWithDispatchType:concurrent_ ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
+    cb_ = (__bridge_retained void*)nb;
+    enc_ = (__bridge_retained void*)ne;
+  }
 }
 void Encoder::barrier() { [E(enc_) memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
 void Encoder::commit() {

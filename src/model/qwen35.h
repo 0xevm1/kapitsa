@@ -112,7 +112,8 @@ class Qwen35 {
     const QLinear* L;
     Buffer y;
   };
-  void enc_qmv_multi(Encoder& e, std::vector<Seg> segs, const Buffer& x, const Tensor* norm);
+  void enc_qmv_multi(Encoder& e, std::vector<Seg> segs, const Buffer& x, const Tensor* norm,
+                     const Buffer* xn_out = nullptr);
   void enc_gdn(Encoder& e, Seq& s, int li, const Layer& L);
   void enc_attn(Encoder& e, Seq& s, int li, const Layer& L, int pos);
   void enc_moe(Encoder& e, const Layer& L);
@@ -135,7 +136,7 @@ class Qwen35 {
   int tmax_;
 
   // state
-  Buffer x_, logits_;
+  Buffer x_, xn_, logits_;
   Buffer qkv_, zb_, ab_, bb_, gq_, gk_, gv_, gg_, gbeta_, gout_;
   Buffer qg_, kr_, vr_, qo_, attn_out_, part_o_, part_ml_;
   Buffer rlog_, slog_, eidx_, ewts_, eh_;

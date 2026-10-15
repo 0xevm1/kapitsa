@@ -51,6 +51,7 @@ int main(int argc, char** argv) {
   for (int i = 0; i < n; ++i) s.tokens()[i] = ids[i];
 
   double t0 = now_ms();
+  if (Encoder::profiling()) fprintf(stderr, "(profiling: prompt timings not meaningful)\n");
   if (tbt) {
     // token by token through the decode path (reference for the batched prefill)
     for (int p = 0; p < n; p += 32) {
@@ -110,6 +111,7 @@ int main(int argc, char** argv) {
     ++done;
   }
   double t_dec = now_ms() - t1;
+  if (Encoder::profiling()) Encoder::profile_report(int(out.size()) - 1);
   if (gpu_n) fprintf(stderr, "mean GPU time per step: %.2f ms (%d steps)\n", gpu_total / gpu_n, gpu_n);
   printf("ids:");
   for (int t : out) printf(" %d", t);

@@ -163,6 +163,10 @@ Qwen35::Qwen35(const std::string& dir, int prefill_chunk) : dir_(dir), tmax_(pre
   if (cfg_.hq / cfg_.hkv > 8) fatal("GQA ratio > 8 unsupported");
   if (cfg_.conv_k != 4) fatal("conv kernel must be 4");
   if (cfg_.moe && (cfg_.moe_I % 512 || cfg_.shared_I % 512)) fatal("expert sizes must be multiples of 512");
+  if (cfg_.moe && (cfg_.top_k + 1) * std::max(cfg_.moe_I, cfg_.shared_I) > 4608) fatal("MoE decode: (k+1)*I > 4608");
+  if (cfg_.moe && (cfg_.experts % 32 || cfg_.experts > 512 || cfg_.top_k > 16)) fatal("MoE: unsupported expert count");
+  if (cfg_.hidden > 4096 || cfg_.lin_hv * cfg_.lin_dv > 4096 || cfg_.hq * cfg_.head_dim > 4096)
+    fatal("decode kernels stage at most 4096 inputs");
   if (embed_.bits != 4) fatal("embedding must be 4-bit");
 
   Gpu::get().make_resident(ws_.buffers());
@@ -178,6 +182,7 @@ void Qwen35::alloc_state() {
   const int C = 2 * cfg_.lin_hk * cfg_.lin_dk + cfg_.lin_hv * cfg_.lin_dv;
   const int VD = cfg_.lin_hv * cfg_.lin_dv;
   x_ = g.alloc(size_t(T) * D * 4, "x");
+  xn_ = g.alloc(size_t(D) * 4, "xn");
   logits_ = g.alloc(size_t(cfg_.vocab) * 4, "logits");
   qkv_ = g.alloc(size_t(T) * C * 4);
   zb_ = g.alloc(size_t(T) * VD * 4);
@@ -306,7 +311,11 @@ static constexpr uint32_t kRows = 4, kSg = 2; // qmv: rows per simdgroup, simdgr
 
 void Qwen35::enc_qmv(Encoder& e, const QLinear& L, const Buffer& x, const Buffer& y, const Buffer* resid,
                      const Tensor* norm) {
-  std::string name = "qmv_b" + std::to_string(L.bits) + "_g" + std::to_string(L.gs) + "_v16_r4_t1";
+  // Tuned on M4 Pro: huge matrices (lm_head) like 4 rows x 4 simdgroups, the rest 2 rows x 8.
+  const bool huge = L.N >= 65536;
+  const uint32_t rows = huge ? 4 : 2, nsg = huge ? 4 : 8;
+  if (L.gs != 64) fatal("qmv: group size %d unsupported", L.gs);
+  std::string name = "qmv2_b" + std::to_string(L.bits) + "_g64_r" + std::to_string(rows);
   if (resid) name += "_add";
   if (norm) name += "_norm";
   static std::unordered_map<std::string, Pipeline> cache;
@@ -322,17 +331,20 @@ void Qwen35::enc_qmv(Encoder& e, const QLinear& L, const Buffer& x, const Buffer
   e.val(5, p);
   e.buf(6, resid ? *resid : y);
   e.buf(7, norm ? norm->buf : y);
-  e.dispatch((L.N + kRows * kSg - 1) / (kRows * kSg), 1, 1, 32 * kSg);
+  e.dispatch((L.N + rows * nsg - 1) / (rows * nsg), 1, 1, 32 * nsg);
 }
 
-void Qwen35::enc_qmv_multi(Encoder& e, std::vector<Seg> segs, const Buffer& x, const Tensor* norm) {
-  static Pipeline pn = Gpu::get().pipeline("qmv_multi_g64_v16_r4_norm");
-  static Pipeline pp = Gpu::get().pipeline("qmv_multi_g64_v16_r4");
-  e.use(norm ? pn : pp);
-  kp::QmvMulti p{};
+void Qwen35::enc_qmv_multi(Encoder& e, std::vector<Seg> segs, const Buffer& x, const Tensor* norm,
+                           const Buffer* xn_out) {
+  static Pipeline pp = Gpu::get().pipeline("qmv2_multi_r2");
+  constexpr uint32_t rows = 2, nsg = 8;
+  e.use(pp);
+  kp::QmvMulti2 p{};
   p.K = segs[0].L->K;
   p.nseg = uint32_t(segs.size());
   p.eps = cfg_.eps;
+  p.norm = norm ? 1u : 0u;
+  p.write_xn = xn_out ? 1u : 0u;
   uint32_t tg = 0;
   for (size_t i = 0; i < 4; ++i) {
     const Seg& s = segs[std::min(i, segs.size() - 1)];
@@ -341,7 +353,7 @@ void Qwen35::enc_qmv_multi(Encoder& e, std::vector<Seg> segs, const Buffer& x, c
       p.N[i] = s.L->N;
       p.bits[i] = uint32_t(s.L->bits);
       p.tg_begin[i] = tg;
-      tg += (s.L->N + kRows * kSg - 1) / (kRows * kSg);
+      tg += (s.L->N + rows * nsg - 1) / (rows * nsg);
     }
     e.buf(int(i * 4 + 0), s.L->w->buf);
     e.buf(int(i * 4 + 1), s.L->s->buf);
@@ -352,7 +364,8 @@ void Qwen35::enc_qmv_multi(Encoder& e, std::vector<Seg> segs, const Buffer& x, c
   e.buf(16, x);
   e.val(17, p);
   e.buf(18, norm ? norm->buf : x);
-  e.dispatch(tg, 1, 1, 32 * kSg);
+  e.buf(19, xn_out ? *xn_out : x);
+  e.dispatch(tg, 1, 1, 32 * nsg);
 }
 
 void Qwen35::enc_gdn(Encoder& e, Seq& s, int li, const Layer& L) {
@@ -408,31 +421,39 @@ void Qwen35::enc_attn(Encoder& e, Seq& s, int li, const Layer& L, int pos) {
 }
 
 void Qwen35::enc_moe(Encoder& e, const Layer& L) {
-  static Pipeline topk = Gpu::get().pipeline("moe_topk");
-  static Pipeline gu = Gpu::get().pipeline("moe_gate_up");
-  static Pipeline dn = Gpu::get().pipeline("moe_down");
-  enc_qmv_multi(e, {{&L.router, rlog_}, {&L.shared_gate, slog_}}, x_, L.post_norm);
-  kp::Topk tp{uint32_t(cfg_.experts), uint32_t(cfg_.top_k), cfg_.norm_topk ? 1u : 0u};
-  e.use(topk);
-  e.buf(0, rlog_); e.buf(1, slog_); e.buf(2, eidx_); e.buf(3, ewts_);
-  e.val(4, tp);
-  e.dispatch(1, 1, 1, 32);
+  // NI_GU: 2 = fused top-k (v2), 3 = separate top-k dispatch + v3 rows 2, 4 = v3 rows 4
+  static int variant = getenv("NI_GU") ? atoi(getenv("NI_GU")) : 3;
+  static Pipeline gu = Gpu::get().pipeline(variant == 2 ? "moe_gate_up2" : variant == 3 ? "moe_gate_up3_r2" : "moe_gate_up3_r4");
+  static Pipeline dn = Gpu::get().pipeline("moe_down2");
+  static Pipeline topk = Gpu::get().pipeline(cfg_.experts == 256 && cfg_.top_k <= 8 ? "moe_topk256" : "moe_topk");
+  constexpr uint32_t nsg = 8;
+  const uint32_t gu_rows = variant == 4 ? 4 : 2, rows = 2;
+  enc_qmv_multi(e, {{&L.router, rlog_}, {&L.shared_gate, slog_}}, x_, L.post_norm, &xn_);
   kp::Moe mp{uint32_t(cfg_.hidden), uint32_t(cfg_.moe_I), uint32_t(cfg_.shared_I), uint32_t(cfg_.top_k), cfg_.eps};
+  uint32_t E = uint32_t(cfg_.experts);
+  if (variant != 2) {
+    kp::Topk tp{E, uint32_t(cfg_.top_k), cfg_.norm_topk ? 1u : 0u};
+    e.use(topk);
+    e.buf(0, rlog_); e.buf(1, slog_); e.buf(2, eidx_); e.buf(3, ewts_);
+    e.val(4, tp);
+    e.dispatch(1, 1, 1, 32);
+  }
   e.use(gu);
   e.buf(0, L.eg.w->buf); e.buf(1, L.eg.s->buf); e.buf(2, L.eg.b->buf);
   e.buf(3, L.eu.w->buf); e.buf(4, L.eu.s->buf); e.buf(5, L.eu.b->buf);
   e.buf(6, L.sg.w->buf); e.buf(7, L.sg.s->buf); e.buf(8, L.sg.b->buf);
   e.buf(9, L.su.w->buf); e.buf(10, L.su.s->buf); e.buf(11, L.su.b->buf);
-  e.buf(12, x_); e.buf(13, L.post_norm->buf); e.buf(14, eidx_); e.buf(15, eh_);
+  e.buf(12, xn_); e.buf(13, rlog_); e.buf(14, slog_); e.buf(15, eh_);
   e.val(16, mp);
-  uint32_t rows = uint32_t(std::max(cfg_.moe_I, cfg_.shared_I));
-  e.dispatch((rows + kRows * kSg - 1) / (kRows * kSg), cfg_.top_k + 1, 1, 32 * kSg);
+  e.buf(17, eidx_); e.buf(18, ewts_); e.val(19, E);
+  uint32_t I = uint32_t(std::max(cfg_.moe_I, cfg_.shared_I));
+  e.dispatch((I + gu_rows * nsg - 1) / (gu_rows * nsg), cfg_.top_k + 1, 1, 32 * nsg);
   e.use(dn);
   e.buf(0, L.ed.w->buf); e.buf(1, L.ed.s->buf); e.buf(2, L.ed.b->buf);
   e.buf(3, L.sd.w->buf); e.buf(4, L.sd.s->buf); e.buf(5, L.sd.b->buf);
   e.buf(6, eh_); e.buf(7, eidx_); e.buf(8, ewts_); e.buf(9, x_);
   e.val(10, mp);
-  e.dispatch((cfg_.hidden + kRows * kSg - 1) / (kRows * kSg), 1, 1, 32 * kSg);
+  e.dispatch((cfg_.hidden + rows * nsg - 1) / (rows * nsg), 1, 1, 32 * nsg);
 }
 
 void Qwen35::encode_step(Encoder& e, Seq& s, int pos, const SamplingParams& sp, uint32_t step, bool sample) {
@@ -446,16 +467,22 @@ void Qwen35::encode_step(Encoder& e, Seq& s, int pos, const SamplingParams& sp, 
   e.val(5, ep);
   e.dispatch((cfg_.hidden / 8 + 63) / 64, 1, 1, 64);
   static int dbg_layers = getenv("NI_DEBUG_LAYERS") ? atoi(getenv("NI_DEBUG_LAYERS")) : -1;
+  // profiling aid: NI_SKIP bitmask 1=moe 2=gdn 4=attn 8=head (output becomes garbage)
+  static int skip = getenv("NI_SKIP") ? atoi(getenv("NI_SKIP")) : 0;
   for (int i = 0; i < cfg_.layers; ++i) {
     if (i == dbg_layers) return;
     const Layer& L = layers_[i];
-    if (L.linear) enc_gdn(e, s, i, L);
-    else enc_attn(e, s, i, L, pos);
+    if (L.linear) {
+      if (!(skip & 2)) enc_gdn(e, s, i, L);
+    } else if (!(skip & 4)) {
+      enc_attn(e, s, i, L, pos);
+    }
     if (i + 1 == dbg_layers && getenv("NI_DEBUG_HALF")) return;
+    if (skip & 1) continue;
     if (cfg_.moe) enc_moe(e, L);
     else fatal("dense MLP not implemented yet");
   }
-  if (!sample) return;
+  if (!sample || (skip & 8)) return;
   enc_sample(e, s, x_, pos + 1, sp, step);
 }
 

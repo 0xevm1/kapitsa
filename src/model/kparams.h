@@ -17,6 +17,15 @@ struct QmvMulti {
   uint32_t bits[4];
 };
 
+struct QmvMulti2 {
+  uint32_t K, nseg;
+  float eps;
+  uint32_t norm, write_xn;
+  uint32_t N[4];
+  uint32_t tg_begin[5];
+  uint32_t bits[4];
+};
+
 struct Embed {
   uint32_t D, gs, tok_off;
 };

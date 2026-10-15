@@ -23,6 +23,7 @@ struct Buffer {
 
 struct Pipeline {
   void* pso = nullptr; // id<MTLComputePipelineState>
+  const char* name = "";
   uint32_t max_threads = 0;
   uint32_t simd_width = 32;
 };
@@ -85,10 +86,17 @@ class Encoder {
   double gpu_ms() const;     // GPU time of the finished command buffer
   ~Encoder();
 
+  // Profiling (NI_PROFILE=1): every dispatch runs in its own command buffer so its GPU time can
+  // be attributed to the kernel. Much slower; for analysis only.
+  static bool profiling();
+  static void profile_report(int steps);
+
  private:
   friend class Gpu;
   void* cb_ = nullptr;
   void* enc_ = nullptr;
+  const char* cur_name_ = "";
+  bool concurrent_ = false;
 };
 
 } // namespace ni

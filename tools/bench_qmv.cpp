@@ -6,6 +6,7 @@
 #include "util/log.h"
 
 #include <cmath>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -64,7 +65,15 @@ int main(int argc, char** argv) {
     uint32_t N, K;
     int bits, gs, rows, nt;
   };
-  std::vector<Case> cases = {
+  std::vector<Case> cases;
+  if (getenv("V2")) {
+    int r = atoi(getenv("V2"));
+    std::string s = "qmv2_b4_g64_r" + std::to_string(r);
+    static std::vector<std::string> names = {s, s + "_norm"};
+    cases = {{names[0].c_str(), 8192, 2048, 4, 64, r, 1}, {names[1].c_str(), 8192, 2048, 4, 64, r, 1},
+             {names[0].c_str(), 2048, 4096, 4, 64, r, 1}, {names[0].c_str(), 2048, 512, 4, 64, r, 1},
+             {names[0].c_str(), 248320, 2048, 4, 64, r, 1}, {names[0].c_str(), 512, 2048, 4, 64, r, 1}};
+  } else cases = {
       {"qmv_b4_g64_v16_r4_t1", 8192, 2048, 4, 64, 4, 1},  {"qmv_b4_g64_v32_r4_t1", 8192, 2048, 4, 64, 4, 1},
       {"qmv_b4_g64_v16_r8_t1", 8192, 2048, 4, 64, 8, 1},  {"qmv_b4_g64_v32_r2_t1", 8192, 2048, 4, 64, 2, 1},
       {"qmv_b4_g64_v16_r2_t1", 8192, 2048, 4, 64, 2, 1},  {"qmv_b4_g64_v16_r4_t1", 2048, 4096, 4, 64, 4, 1},
@@ -73,6 +82,9 @@ int main(int argc, char** argv) {
       {"qmv_b8_g64_v16_r4_t1", 256, 2048, 8, 64, 4, 1},   {"qmv_b4_g64_v16_r4_t4", 8192, 2048, 4, 64, 4, 4},
   };
   int nsg = argc > 1 ? atoi(argv[1]) : 2;
+  std::vector<uint16_t> nwv(8192, f32_to_bf16(1.0f));
+  Buffer nw = g.alloc(8192 * 2);
+  memcpy(nw.ptr(), nwv.data(), 8192 * 2);
 
   for (auto& c : cases) {
     size_t bytes_per = size_t(c.N) * c.K * c.bits / 8 + size_t(c.N) * c.K / c.gs * 4;
@@ -94,7 +106,7 @@ int main(int argc, char** argv) {
       for (int r = 0; r < reps; ++r)
         for (auto& m : mats) {
           e->buf(0, m.w); e->buf(1, m.s); e->buf(2, m.b); e->buf(3, x); e->buf(4, y);
-          e->val(5, prm); e->buf(6, y);
+          e->val(5, prm); e->buf(6, y); e->buf(7, nw);
           e->dispatch(ntg, 1, 1, 32 * nsg);
         }
       e->commit_and_wait();
@@ -106,6 +118,12 @@ int main(int argc, char** argv) {
     double gbs = bytes_per * copies / (ms * 1e-3) / 1e9;
 
     // correctness on the last matrix (y holds its result)
+    if (std::string(c.kernel).find("_norm") != std::string::npos) {
+      double ss = 0;
+      for (uint32_t i = 0; i < c.K; ++i) ss += double(x.as<float>()[i]) * x.as<float>()[i];
+      float inv = float(1.0 / std::sqrt(ss / c.K + 1e-6));
+      for (uint32_t i = 0; i < c.K; ++i) x.as<float>()[i] *= inv;  // reference uses normalized x
+    }
     double maxrel = 0;
     for (uint32_t t = 0; t < (uint32_t)c.nt; ++t)
       for (uint32_t row : {0u, 1u, c.N / 2, c.N - 1}) {

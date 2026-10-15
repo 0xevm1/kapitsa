@@ -164,3 +164,154 @@ NI_INLINE void qmv_seg(const device uint32_t* w, const device bfloat* s, const d
 
 NI_QMV_MULTI(qmv_multi_g64_v16_r4_norm, 16, 4, 64, true)
 NI_QMV_MULTI(qmv_multi_g64_v16_r4, 16, 4, 64, false)
+
+// ---- v2: x staged once per threadgroup (fp32, optionally RMS-normalized) ----
+// Threadgroup = NSG simdgroups; each simdgroup owns ROWS rows. The input vector is loaded (and
+// normalized) once per threadgroup instead of once per simdgroup.
+template <int BITS, int VPL, int ROWS, int GS, bool ADD, bool NORM>
+NI_INLINE void qmv2_impl(const device uint32_t* w, const device bfloat* scales, const device bfloat* biases,
+                         const device float* x, device float* y, uint N, uint K, float eps,
+                         const device float* resid, const device bfloat* nw, threadgroup float* xs,
+                         threadgroup float* red, uint row0, uint tid, uint ntg, uint lane) {
+  constexpr int PER_WORD = 32 / BITS;
+  constexpr uint MASK = (1u << BITS) - 1u;
+  constexpr int WORDS = VPL / PER_WORD;
+  // stage x
+  float ss = 0.0f;
+  for (uint i = tid; i < K / 4; i += ntg) {
+    float4 v = ((const device float4*)x)[i];
+    ((threadgroup float4*)xs)[i] = v;
+    if (NORM) ss += dot(v, v);
+  }
+  if (NORM) {
+    ss = tg_sum(ss, red, tid, ntg);
+    float inv = metal::precise::rsqrt(ss / float(K) + eps);
+    for (uint i = tid; i < K; i += ntg) xs[i] = xs[i] * inv * float(nw[i]);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (row0 >= N) return;
+
+  const uint words_per_row = K / PER_WORD;
+  const uint groups_per_row = K / GS;
+  float acc[ROWS];
+  uint rows[ROWS];
+  for (int r = 0; r < ROWS; ++r) {
+    acc[r] = 0.0f;
+    rows[r] = min(row0 + r, N - 1);
+  }
+  for (uint k0 = lane * VPL; k0 < K; k0 += 32 * VPL) {
+    float xv[VPL];
+    float xsum = 0.0f;
+    for (int i = 0; i < VPL / 4; ++i) {
+      float4 v = ((threadgroup float4*)(xs + k0))[i];
+      xsum += v.x + v.y + v.z + v.w;
+      for (int e = 0; e < 4; ++e) xv[i * 4 + e] = v[e] * float(1.0f / float(1u << (BITS * ((i * 4 + e) % PER_WORD))));
+    }
+    const uint g = k0 / GS, wo = k0 / PER_WORD;
+    for (int r = 0; r < ROWS; ++r) {
+      const device uint32_t* wp = w + rows[r] * words_per_row + wo;
+      uint32_t wv[WORDS];
+      if (WORDS == 4) {
+        uint4 v = *(const device uint4*)wp;
+        wv[0] = v.x; wv[1] = v.y; wv[2] = v.z; wv[3] = v.w;
+      } else if (WORDS == 2) {
+        uint2 v = *(const device uint2*)wp;
+        wv[0] = v.x; wv[1] = v.y;
+      } else {
+        for (int i = 0; i < WORDS; ++i) wv[i] = wp[i];
+      }
+      float d = 0.0f;
+      for (int i = 0; i < WORDS; ++i)
+        for (int j = 0; j < PER_WORD; ++j) d += float(wv[i] & (MASK << (BITS * j))) * xv[i * PER_WORD + j];
+      acc[r] += float(scales[rows[r] * groups_per_row + g]) * d + float(biases[rows[r] * groups_per_row + g]) * xsum;
+    }
+  }
+  for (int r = 0; r < ROWS; ++r) {
+    float v = simd_sum(acc[r]);
+    uint row = row0 + r;
+    if (lane == 0 && row < N) {
+      if (ADD) v += resid[row];
+      y[row] = v;
+    }
+  }
+}
+
+#define NI_QMV2(NAME, BITS, VPL, ROWS, GS, ADD, NORM)                                                     \
+  [[kernel]] void NAME(const device uint32_t* w [[buffer(0)]], const device bfloat* scales [[buffer(1)]], \
+                       const device bfloat* biases [[buffer(2)]], const device float* x [[buffer(3)]],     \
+                       device float* y [[buffer(4)]], constant QmvParams& p [[buffer(5)]],                 \
+                       const device float* resid [[buffer(6)]], const device bfloat* nw [[buffer(7)]],     \
+                       uint tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+                       uint ntg [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],   \
+                       uint nsg [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {  \
+    threadgroup float xs[4096];                                                                           \
+    threadgroup float red[32];                                                                            \
+    uint row0 = (tgp * nsg + sg) * ROWS;                                                                  \
+    qmv2_impl<BITS, VPL, ROWS, GS, ADD, NORM>(w, scales, biases, x, y, p.N, p.K, p.eps, resid, nw, xs, red, \
+                                              row0, tid, ntg, lane);                                      \
+  }
+
+NI_QMV2(qmv2_b4_g64_r4, 4, 16, 4, 64, false, false)
+NI_QMV2(qmv2_b4_g64_r2, 4, 16, 2, 64, false, false)
+NI_QMV2(qmv2_b4_g64_r1, 4, 16, 1, 64, false, false)
+NI_QMV2(qmv2_b4_g64_r4_add, 4, 16, 4, 64, true, false)
+NI_QMV2(qmv2_b4_g64_r2_add, 4, 16, 2, 64, true, false)
+NI_QMV2(qmv2_b4_g64_r4_norm, 4, 16, 4, 64, false, true)
+NI_QMV2(qmv2_b4_g64_r2_norm, 4, 16, 2, 64, false, true)
+NI_QMV2(qmv2_b8_g64_r4_norm, 8, 16, 4, 64, false, true)
+NI_QMV2(qmv2_b8_g64_r2_norm, 8, 16, 2, 64, false, true)
+NI_QMV2(qmv2_b8_g64_r1_norm, 8, 16, 1, 64, false, true)
+
+// Multi-segment v2 (shared input, up to 4 matrices, 4- or 8-bit each). With xn_out bound
+// (write_xn=1), threadgroup 0 also stores the staged (normalized) x for later kernels.
+struct QmvMulti2Params {
+  uint K;
+  uint nseg;
+  float eps;
+  uint norm;
+  uint write_xn;
+  uint N[4];
+  uint tg_begin[5];
+  uint bits[4];
+};
+
+#define NI_QMV2_MULTI(NAME, ROWS)                                                                         \
+  [[kernel]] void NAME(                                                                                  \
+      const device uint32_t* w0 [[buffer(0)]], const device bfloat* s0 [[buffer(1)]],                    \
+      const device bfloat* b0 [[buffer(2)]], device float* y0 [[buffer(3)]],                             \
+      const device uint32_t* w1 [[buffer(4)]], const device bfloat* s1 [[buffer(5)]],                    \
+      const device bfloat* b1 [[buffer(6)]], device float* y1 [[buffer(7)]],                             \
+      const device uint32_t* w2 [[buffer(8)]], const device bfloat* s2 [[buffer(9)]],                    \
+      const device bfloat* b2 [[buffer(10)]], device float* y2 [[buffer(11)]],                           \
+      const device uint32_t* w3 [[buffer(12)]], const device bfloat* s3 [[buffer(13)]],                  \
+      const device bfloat* b3 [[buffer(14)]], device float* y3 [[buffer(15)]],                           \
+      const device float* x [[buffer(16)]], constant QmvMulti2Params& p [[buffer(17)]],                  \
+      const device bfloat* nw [[buffer(18)]], device float* xn_out [[buffer(19)]],                       \
+      uint tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],               \
+      uint ntg [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],                  \
+      uint nsg [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {                \
+    threadgroup float xs[4096];                                                                           \
+    threadgroup float red[32];                                                                            \
+    stage_x(x, p.K, p.norm != 0, p.eps, nw, xs, red, tid, ntg);                                          \
+    if (p.write_xn && tgp == 0)                                                                           \
+      for (uint i = tid; i < p.K; i += ntg) xn_out[i] = xs[i];                                            \
+    uint seg = 0;                                                                                        \
+    for (uint i = 1; i < p.nseg; ++i)                                                                    \
+      if (tgp >= p.tg_begin[i]) seg = i;                                                                  \
+    uint row0 = ((tgp - p.tg_begin[seg]) * nsg + sg) * ROWS;                                             \
+    const uint N = p.N[seg];                                                                              \
+    if (row0 >= N) return;                                                                                \
+    const device uint32_t* W = seg == 0 ? w0 : seg == 1 ? w1 : seg == 2 ? w2 : w3;                        \
+    const device bfloat* S = seg == 0 ? s0 : seg == 1 ? s1 : seg == 2 ? s2 : s3;                          \
+    const device bfloat* B = seg == 0 ? b0 : seg == 1 ? b1 : seg == 2 ? b2 : b3;                          \
+    device float* Y = seg == 0 ? y0 : seg == 1 ? y1 : seg == 2 ? y2 : y3;                                 \
+    float acc[ROWS];                                                                                      \
+    if (p.bits[seg] == 8) qmv2_rows<8, 16, ROWS, 64>(W, S, B, xs, N, p.K, row0, lane, acc);              \
+    else qmv2_rows<4, 16, ROWS, 64>(W, S, B, xs, N, p.K, row0, lane, acc);                                \
+    if (lane == 0)                                                                                        \
+      for (int r = 0; r < ROWS; ++r)                                                                      \
+        if (row0 + r < N) Y[row0 + r] = acc[r];                                                           \
+  }
+
+NI_QMV2_MULTI(qmv2_multi_r2, 2)
+NI_QMV2_MULTI(qmv2_multi_r1, 1)

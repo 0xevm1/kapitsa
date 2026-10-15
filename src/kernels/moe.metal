@@ -282,3 +282,237 @@ struct CombineParams {
   acc += wts[t * (p.k + 1) + p.k] * ((const device float4*)(ys + t * p.D))[d4];
   ((device float4*)(x + t * p.D))[d4] += acc;
 }
+
+// ---- v2 MoE decode: top-k fused into gate/up, x staged once per threadgroup ----
+// grid: x = row tiles of (nsg * ROWS) rows over max(I, SI), y = slot (0..k-1 routed, k = shared).
+// Every threadgroup re-derives the routing from the router logits (256 floats; cheap) so no
+// separate top-k dispatch is needed; threadgroup (0,0) publishes idx/wts for moe_down2.
+NI_INLINE void route_topk(const device float* logits, const device float* shared, uint E, uint k, bool norm,
+                          threadgroup uint* tidx, threadgroup float* twts, uint lane) {
+  const uint per = E / 32;
+  float v[16];
+  float mx = -INFINITY;
+  for (uint i = 0; i < per; ++i) {
+    v[i] = logits[lane * per + i];
+    mx = max(mx, v[i]);
+  }
+  mx = simd_max(mx);
+  float sum = 0.0f;
+  for (uint i = 0; i < per; ++i) {
+    v[i] = metal::precise::exp(v[i] - mx);
+    sum += v[i];
+  }
+  sum = simd_sum(sum);
+  uint taken = 0;
+  float sel = 0.0f;
+  for (uint r = 0; r < k; ++r) {
+    float best = -1.0f;
+    uint bi = 0xffffffff;
+    for (uint i = 0; i < per; ++i)
+      if (!(taken & (1u << i)) && v[i] > best) { best = v[i]; bi = lane * per + i; }
+    float gbest = simd_max(best);
+    uint win = simd_min(best == gbest ? bi : 0xffffffff);
+    if (win != 0xffffffff && win / per == lane) taken |= 1u << (win % per);
+    if (lane == 0) { tidx[r] = win; twts[r] = gbest / sum; }
+    sel += gbest / sum;
+  }
+  if (lane == 0) {
+    if (norm)
+      for (uint r = 0; r < k; ++r) twts[r] /= sel;
+    twts[k] = sigmoid(shared[0]);
+  }
+}
+
+[[kernel]] void moe_gate_up2(const device uint32_t* gw [[buffer(0)]], const device bfloat* gsc [[buffer(1)]],
+                             const device bfloat* gbi [[buffer(2)]], const device uint32_t* uw [[buffer(3)]],
+                             const device bfloat* usc [[buffer(4)]], const device bfloat* ubi [[buffer(5)]],
+                             const device uint32_t* sgw [[buffer(6)]], const device bfloat* sgs [[buffer(7)]],
+                             const device bfloat* sgb [[buffer(8)]], const device uint32_t* suw [[buffer(9)]],
+                             const device bfloat* sus [[buffer(10)]], const device bfloat* sub [[buffer(11)]],
+                             const device float* xn [[buffer(12)]], const device float* logits [[buffer(13)]],
+                             const device float* shared_logit [[buffer(14)]], device float* h [[buffer(15)]],
+                             constant MoeParams& p [[buffer(16)]], device uint* idx_out [[buffer(17)]],
+                             device float* wts_out [[buffer(18)]], constant uint& E [[buffer(19)]],
+                             uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                             uint2 ntg2 [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                             uint nsg [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int ROWS = 2;
+  const uint ntg = ntg2.x;
+  threadgroup float xs[4096];
+  threadgroup uint tidx[16];
+  threadgroup float twts[17];
+  const uint slot = tgp.y;
+  const bool shared = slot == p.k;
+  if (sg == 0) route_topk(logits, shared_logit, E, p.k, true, tidx, twts, lane);
+  for (uint i = tid; i < p.D / 4; i += ntg) ((threadgroup float4*)xs)[i] = ((const device float4*)xn)[i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tgp.x == 0 && tgp.y == 0 && tid <= p.k) {
+    if (tid < p.k) idx_out[tid] = tidx[tid];
+    wts_out[tid] = twts[tid];
+  }
+  const uint N = shared ? p.SI : p.I;
+  const uint row0 = (tgp.x * nsg + sg) * ROWS;
+  if (row0 >= N) return;
+  const uint K = p.D, wpr = K / 8, gpr = K / 64;
+  const device uint32_t *G = gw, *U = uw;
+  const device bfloat *Gs = gsc, *Gb = gbi, *Us = usc, *Ub = ubi;
+  if (shared) {
+    G = sgw; Gs = sgs; Gb = sgb; U = suw; Us = sus; Ub = sub;
+  } else {
+    uint e = tidx[slot];
+    G += e * N * wpr; U += e * N * wpr;
+    Gs += e * N * gpr; Gb += e * N * gpr; Us += e * N * gpr; Ub += e * N * gpr;
+  }
+  float ag[ROWS], au[ROWS];
+  qmv2_rows<4, 16, ROWS, 64>(G, Gs, Gb, xs, N, K, row0, lane, ag);
+  qmv2_rows<4, 16, ROWS, 64>(U, Us, Ub, xs, N, K, row0, lane, au);
+  if (lane == 0)
+    for (int r = 0; r < ROWS; ++r)
+      if (row0 + r < N) h[slot * max(p.I, p.SI) + row0 + r] = silu(ag[r]) * au[r];
+}
+
+template <int NI_GU_ROWS>
+NI_INLINE void moe_gate_up3_impl(const device uint32_t* gw, const device bfloat* gsc,
+                             const device bfloat* gbi, const device uint32_t* uw,
+                             const device bfloat* usc, const device bfloat* ubi,
+                             const device uint32_t* sgw, const device bfloat* sgs,
+                             const device bfloat* sgb, const device uint32_t* suw,
+                             const device bfloat* sus, const device bfloat* sub,
+                             const device float* xn, const device float* logits,
+                             const device float* shared_logit, device float* h,
+                             constant MoeParams& p, const device uint* idx_out,
+                             const device float* wts_out, constant uint& E,
+                             uint2 tgp, uint tid,
+                             uint2 ntg2, uint sg,
+                             uint nsg, uint lane, threadgroup float* xs, threadgroup uint* tidx, threadgroup float* twts) {
+  constexpr int ROWS = NI_GU_ROWS;
+  const uint ntg = ntg2.x;
+  const uint slot = tgp.y;
+  const bool shared = slot == p.k;
+  if (tid <= p.k) {
+    if (tid < p.k) tidx[tid] = idx_out[tid];  // precomputed by moe_topk
+    twts[tid] = wts_out[tid];
+  }
+  for (uint i = tid; i < p.D / 4; i += ntg) ((threadgroup float4*)xs)[i] = ((const device float4*)xn)[i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint N = shared ? p.SI : p.I;
+  const uint row0 = (tgp.x * nsg + sg) * ROWS;
+  if (row0 >= N) return;
+  const uint K = p.D, wpr = K / 8, gpr = K / 64;
+  const device uint32_t *G = gw, *U = uw;
+  const device bfloat *Gs = gsc, *Gb = gbi, *Us = usc, *Ub = ubi;
+  if (shared) {
+    G = sgw; Gs = sgs; Gb = sgb; U = suw; Us = sus; Ub = sub;
+  } else {
+    uint e = tidx[slot];
+    G += e * N * wpr; U += e * N * wpr;
+    Gs += e * N * gpr; Gb += e * N * gpr; Us += e * N * gpr; Ub += e * N * gpr;
+  }
+  float ag[ROWS], au[ROWS];
+  qmv2_rows<4, 16, ROWS, 64>(G, Gs, Gb, xs, N, K, row0, lane, ag);
+  qmv2_rows<4, 16, ROWS, 64>(U, Us, Ub, xs, N, K, row0, lane, au);
+  if (lane == 0)
+    for (int r = 0; r < ROWS; ++r)
+      if (row0 + r < N) h[slot * max(p.I, p.SI) + row0 + r] = silu(ag[r]) * au[r];
+}
+
+
+#define NI_GU3(NAME, R)                                                                                    \
+  [[kernel]] void NAME(const device uint32_t* gw [[buffer(0)]], const device bfloat* gsc [[buffer(1)]],      \
+                       const device bfloat* gbi [[buffer(2)]], const device uint32_t* uw [[buffer(3)]],      \
+                       const device bfloat* usc [[buffer(4)]], const device bfloat* ubi [[buffer(5)]],       \
+                       const device uint32_t* sgw [[buffer(6)]], const device bfloat* sgs [[buffer(7)]],     \
+                       const device bfloat* sgb [[buffer(8)]], const device uint32_t* suw [[buffer(9)]],     \
+                       const device bfloat* sus [[buffer(10)]], const device bfloat* sub [[buffer(11)]],     \
+                       const device float* xn [[buffer(12)]], const device float* logits [[buffer(13)]],     \
+                       const device float* shared_logit [[buffer(14)]], device float* h [[buffer(15)]],      \
+                       constant MoeParams& p [[buffer(16)]], const device uint* idx_out [[buffer(17)]],      \
+                       const device float* wts_out [[buffer(18)]], constant uint& E [[buffer(19)]],          \
+                       uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+                       uint2 ntg2 [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],   \
+                       uint nsg [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {    \
+    threadgroup float xs[4096];                                                                             \
+    threadgroup uint tidx[16];                                                                              \
+    threadgroup float twts[17];                                                                             \
+    moe_gate_up3_impl<R>(gw, gsc, gbi, uw, usc, ubi, sgw, sgs, sgb, suw, sus, sub, xn, logits, shared_logit, h, p, \
+                         idx_out, wts_out, E, tgp, tid, ntg2, sg, nsg, lane, xs, tidx, twts);               \
+  }
+NI_GU3(moe_gate_up3_r2, 2)
+NI_GU3(moe_gate_up3_r4, 4)
+
+// grid: row tiles over D. x[row] += sum_slot wts[slot] * (down_slot[row] . h[slot]); h staged once.
+[[kernel]] void moe_down2(const device uint32_t* dw [[buffer(0)]], const device bfloat* dsc [[buffer(1)]],
+                          const device bfloat* dbi [[buffer(2)]], const device uint32_t* sdw [[buffer(3)]],
+                          const device bfloat* sds [[buffer(4)]], const device bfloat* sdb [[buffer(5)]],
+                          const device float* h [[buffer(6)]], const device uint* idx [[buffer(7)]],
+                          const device float* wts [[buffer(8)]], device float* x [[buffer(9)]],
+                          constant MoeParams& p [[buffer(10)]], uint tgp [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]], uint ntg [[threads_per_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int ROWS = 2;
+  threadgroup float hs[9 * 512];  // (k + 1) * max(I, SI) <= 4608 (checked on the host)
+  const uint hstride = max(p.I, p.SI);
+  for (uint i = tid; i < (p.k + 1) * hstride / 4; i += ntg) ((threadgroup float4*)hs)[i] = ((const device float4*)h)[i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint row0 = (tgp * nsg + sg) * ROWS;
+  if (row0 >= p.D) return;
+  float tot[ROWS] = {0.0f, 0.0f};
+  for (uint slot = 0; slot <= p.k; ++slot) {
+    const bool shared = slot == p.k;
+    const uint K = shared ? p.SI : p.I;
+    const uint wpr = K / 8, gpr = K / 64;
+    const device uint32_t* W = shared ? sdw : dw + idx[slot] * p.D * wpr;
+    const device bfloat* S = shared ? sds : dsc + idx[slot] * p.D * gpr;
+    const device bfloat* B = shared ? sdb : dbi + idx[slot] * p.D * gpr;
+    float a[ROWS];
+    qmv2_rows<4, 16, ROWS, 64>(W, S, B, hs + slot * hstride, p.D, K, row0, lane, a);
+    const float ws = wts[slot];
+    for (int r = 0; r < ROWS; ++r) tot[r] += ws * a[r];
+  }
+  if (lane == 0)
+    for (int r = 0; r < ROWS; ++r)
+      if (row0 + r < p.D) x[row0 + r] += tot[r];
+}
+
+// Faster single-simdgroup top-k for E = 256, k <= 8: compile-time sizes, fast exp, one pass of
+// simd reductions per round.
+[[kernel]] void moe_topk256(const device float* logits [[buffer(0)]], const device float* shared [[buffer(1)]],
+                            device uint* idx [[buffer(2)]], device float* wts [[buffer(3)]],
+                            constant TopkParams& p [[buffer(4)]], uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint PER = 8;
+  float4 a = ((const device float4*)logits)[lane * 2], b = ((const device float4*)logits)[lane * 2 + 1];
+  float v[PER] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+  float mx = v[0];
+  for (uint i = 1; i < PER; ++i) mx = max(mx, v[i]);
+  mx = simd_max(mx);
+  float sum = 0.0f;
+  for (uint i = 0; i < PER; ++i) {
+    v[i] = metal::fast::exp(v[i] - mx);
+    sum += v[i];
+  }
+  sum = simd_sum(sum);
+  float sel = 0.0f, wsel[8];
+  uint isel[8];
+  for (uint r = 0; r < p.k; ++r) {
+    float best = -1.0f;
+    uint bi = 0;
+    for (uint i = 0; i < PER; ++i)
+      if (v[i] > best) { best = v[i]; bi = i; }
+    float g = simd_max(best);
+    uint win = simd_min(best == g ? lane * PER + bi : 0xffffffffu);
+    if (win / PER == lane) v[win % PER] = -1.0f;
+    wsel[r] = g;
+    isel[r] = win;
+    sel += g;
+  }
+  if (lane < p.k) {
+    float w = 0.0f;
+    uint ii = 0;
+    for (uint r = 0; r < p.k; ++r)
+      if (r == lane) { w = wsel[r]; ii = isel[r]; }
+    idx[lane] = ii;
+    wts[lane] = p.norm ? w / sel : w / sum;
+  }
+  if (lane == p.k) wts[p.k] = sigmoid(shared[0]);
+}
