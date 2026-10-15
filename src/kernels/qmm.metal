@@ -111,6 +111,10 @@ NI_INLINE void qmm_tile(const device half* X, const device uint32_t* W, const de
 
 NI_QMM(qmm_b4_m32_n32, 4, 32, 32)
 NI_QMM(qmm_b4_m64_n64, 4, 64, 64)
+NI_QMM(qmm_b4_m16_n64, 4, 16, 64)
+NI_QMM(qmm_b4_m32_n64, 4, 32, 64)
+NI_QMM(qmm_b4_m64_n32, 4, 64, 32)
+NI_QMM(qmm_b4_m32_n128, 4, 32, 128)
 NI_QMM(qmm_b8_m32_n32, 8, 32, 32)
 NI_QMM(qmm_b8_m64_n64, 8, 64, 64)
 
@@ -135,3 +139,4 @@ NI_QMM(qmm_b8_m64_n64, 8, 64, 64)
 
 NI_QMM_MOE(qmm_moe_b4_m16_n64, 4, 16, 64)
 NI_QMM_MOE(qmm_moe_b4_m32_n64, 4, 32, 64)
+NI_QMM_MOE(qmm_moe_b4_m64_n64, 4, 64, 64)

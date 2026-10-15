@@ -524,7 +524,7 @@ void Qwen35::enc_rows_half(Encoder& e, const Buffer& x, const Tensor* norm, cons
 }
 
 void Qwen35::enc_qmm(Encoder& e, const QLinear& L, const Buffer& xh, const Buffer& y, int M, bool add) {
-  const bool big = M > 32;
+  const bool big = M >= 64 && L.bits == 4;
   const int BM = big ? 64 : 32, BN = big ? 64 : 32;
   std::string n = "qmm_b" + std::to_string(L.bits) + (big ? "_m64_n64" : "_m32_n32");
   e.use(pipe(n));
@@ -558,7 +558,12 @@ void Qwen35::enc_moe_prefill(Encoder& e, const Layer& L, int T) {
   e.buf(0, rlog_); e.buf(1, slog_); e.buf(2, ridx_); e.buf(3, rwts_);
   e.val(4, tp);
   e.dispatch(T, 1, 1, 32);
-  const int bm = P / cfg_.experts >= 24 ? 32 : 16;
+  const int per_expert = P / cfg_.experts;
+  // 16-row tiles measured fastest for expert GEMMs at every chunk size (32-row tiles hit a
+  // 2-3 TFLOP/s pathology on M4 Pro; 64-row tiles waste more rows in partial tiles).
+  int bm = 16;
+  (void)per_expert;
+  if (getenv("NI_BM")) bm = atoi(getenv("NI_BM"));
   kp::Bucket bp{uint32_t(P), uint32_t(k), uint32_t(cfg_.experts), uint32_t(bm)};
   e.use(pipe("moe_bucket"));
   e.buf(0, ridx_); e.buf(1, spair_); e.buf(2, stok_); e.buf(3, tiles_); e.buf(4, ntiles_);

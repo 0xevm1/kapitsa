@@ -26,7 +26,7 @@ struct EngineOptions {
   std::string model_id;        // id reported by /v1/models (default: directory name)
   int context = 32768;         // capacity of each slot (tokens)
   int slots = 2;               // conversations kept warm at once (each has its own KV/state)
-  int prefill_chunk = 512;
+  int prefill_chunk = 2048;
 };
 
 struct ChatRequest {

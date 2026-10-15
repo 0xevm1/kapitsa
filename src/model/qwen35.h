@@ -78,7 +78,7 @@ struct SamplingParams {
 
 class Qwen35 {
  public:
-  explicit Qwen35(const std::string& model_dir, int prefill_chunk = 512);
+  explicit Qwen35(const std::string& model_dir, int prefill_chunk = 2048);
   const Qwen35Config& config() const { return cfg_; }
 
   std::unique_ptr<Seq> new_seq(int cap);

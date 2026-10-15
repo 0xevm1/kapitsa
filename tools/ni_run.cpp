@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
   }
 
   Gpu& g = Gpu::get();
-  Qwen35 m(dir);
+  Qwen35 m(dir, getenv("NI_CHUNK") ? atoi(getenv("NI_CHUNK")) : 2048);
   auto seq = m.new_seq(8192);
   Seq& s = *seq;
   SamplingParams sp;
