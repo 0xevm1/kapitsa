@@ -1,0 +1,50 @@
+// Byte-level BPE tokenizer for HF tokenizer.json files (Qwen2/3/3.5 family): NFC normalization,
+// Qwen's pre-tokenizer split, GPT-2 byte-to-unicode mapping, ranked merges, added tokens.
+#pragma once
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace ni {
+
+class Tokenizer {
+ public:
+  void load(const std::string& tokenizer_json);
+  // Added tokens (e.g. <|im_start|>) in `text` are always recognized, as HF tokenizers do.
+  std::vector<int> encode(const std::string& text) const;
+  std::string decode(const std::vector<int>& ids) const;
+  // Raw bytes of one token (may be a partial UTF-8 sequence).
+  const std::string& token_bytes(int id) const;
+  int find(const std::string& token) const; // -1 if absent
+  int vocab_size() const { return int(id_to_bytes_.size()); }
+  bool is_special(int id) const;
+
+ private:
+  void bpe(const std::string& word, std::vector<int>& out) const;
+  void encode_plain(const std::string& text, std::vector<int>& out) const;
+
+  std::unordered_map<std::string, int> vocab_;        // byte-level string -> id
+  std::vector<std::string> id_to_bytes_;              // id -> raw bytes
+  std::unordered_map<uint64_t, std::pair<int, int>> merges_; // (a,b) -> (rank, merged id)
+  std::vector<std::pair<std::string, int>> added_;    // content -> id, longest first
+  std::vector<bool> special_;
+  int byte_id_[256];
+  mutable std::unordered_map<std::string, std::vector<int>> cache_;
+  mutable std::mutex cache_mu_;
+};
+
+// Incremental UTF-8-safe detokenizer: feeds token ids, emits only complete UTF-8 text.
+class StreamDecoder {
+ public:
+  explicit StreamDecoder(const Tokenizer& t) : tok_(t) {}
+  std::string push(int id);
+  std::string flush();
+
+ private:
+  const Tokenizer& tok_;
+  std::string pending_;
+};
+
+} // namespace ni

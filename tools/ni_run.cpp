@@ -31,8 +31,11 @@ int main(int argc, char** argv) {
   int n_gen = argc > 3 ? atoi(argv[3]) : 32;
   float temp = argc > 4 ? float(atof(argv[4])) : 0.0f;
   const char* dump = nullptr;
-  for (int i = 1; i < argc - 1; ++i)
-    if (!strcmp(argv[i], "--dump-logits")) dump = argv[i + 1];
+  bool tbt = false;
+  for (int i = 1; i < argc; ++i) {
+    if (i + 1 < argc && !strcmp(argv[i], "--dump-logits")) dump = argv[i + 1];
+    if (!strcmp(argv[i], "--tbt")) tbt = true;
+  }
 
   Gpu& g = Gpu::get();
   Qwen35 m(dir, 4096);
@@ -45,12 +48,22 @@ int main(int argc, char** argv) {
   int n = int(ids.size());
   for (int i = 0; i < n; ++i) m.tokens()[i] = ids[i];
 
-  // Prompt: one command buffer per 32 tokens (T=1 path for now; batched prefill comes later).
   double t0 = now_ms();
-  for (int p = 0; p < n; p += 32) {
-    auto e = g.begin();
-    for (int q = p; q < std::min(n, p + 32); ++q) m.encode_step(*e, q, sp, 0, q == n - 1);
-    e->commit_and_wait();
+  if (tbt) {
+    // token by token through the decode path (reference for the batched prefill)
+    for (int p = 0; p < n; p += 32) {
+      auto e = g.begin();
+      for (int q = p; q < std::min(n, p + 32); ++q) m.encode_step(*e, q, sp, 0, q == n - 1);
+      e->commit_and_wait();
+    }
+  } else {
+    int C = m.prefill_chunk();
+    for (int p = 0; p < n; p += C) {
+      int T = std::min(C, n - p);
+      auto e = g.begin();
+      m.encode_prefill(*e, p, T, sp, 0, p + T == n);
+      e->commit_and_wait();
+    }
   }
   double t_prompt = now_ms() - t0;
   if (dump) {
@@ -68,6 +81,8 @@ int main(int argc, char** argv) {
   int pos = n;
   int done = 1;
   bool stop = false;
+  double gpu_total = 0;
+  int gpu_n = 0;
   for (int s = 1; s < n_gen && !stop; ++s) {
     auto e = g.begin();
     m.encode_step(*e, pos, sp, uint32_t(s), true);
@@ -76,6 +91,8 @@ int main(int argc, char** argv) {
     ++pos;
     while (inflight.size() > 2 || (s == n_gen - 1 && !inflight.empty())) {
       inflight.front()->wait();
+      gpu_total += inflight.front()->gpu_ms();
+      ++gpu_n;
       inflight.pop_front();
       int tok = m.tokens()[n + done];
       out.push_back(tok);
@@ -91,6 +108,7 @@ int main(int argc, char** argv) {
     ++done;
   }
   double t_dec = now_ms() - t1;
+  if (gpu_n) fprintf(stderr, "mean GPU time per step: %.2f ms (%d steps)\n", gpu_total / gpu_n, gpu_n);
   printf("ids:");
   for (int t : out) printf(" %d", t);
   printf("\n");

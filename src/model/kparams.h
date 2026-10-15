@@ -60,4 +60,26 @@ struct Sample {
   uint32_t seed, step, out_index;
 };
 
+struct Qmm {
+  uint32_t M, N, K, x_ld, y_ld, add, gs, w_expert_stride, s_expert_stride;
+};
+
+struct AttnPref {
+  uint32_t T, Hq, Hkv, pos0, max_seq;
+  float scale;
+};
+
+struct Bucket {
+  uint32_t P, k, E, BM;
+};
+
+struct Rows {
+  uint32_t D, norm;
+  float eps;
+};
+
+struct Combine {
+  uint32_t D, k;
+};
+
 } // namespace ni::kp

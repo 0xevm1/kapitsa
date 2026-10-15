@@ -98,7 +98,8 @@ QLinear Qwen35::qlin(const std::string& name, bool required) {
   return L;
 }
 
-Qwen35::Qwen35(const std::string& dir, int max_seq) : dir_(dir), max_seq_(max_seq) {
+Qwen35::Qwen35(const std::string& dir, int max_seq, int prefill_chunk)
+    : dir_(dir), max_seq_(max_seq), tmax_(prefill_chunk) {
   double t0 = now_ms();
   load_config(dir);
   // Text-only engine for now: skip the vision tower and (until speculative decoding lands) MTP.
@@ -174,7 +175,7 @@ Qwen35::Qwen35(const std::string& dir, int max_seq) : dir_(dir), max_seq_(max_se
 void Qwen35::alloc_state() {
   Gpu& g = Gpu::get();
   const int D = cfg_.hidden;
-  const int T = 1; // decode path; prefill buffers are sized separately later
+  const int T = tmax_; // activation buffers hold a whole prefill chunk; decode uses row 0
   const int C = 2 * cfg_.lin_hk * cfg_.lin_dk + cfg_.lin_hv * cfg_.lin_dv;
   const int VD = cfg_.lin_hv * cfg_.lin_dv;
   tok_ = g.alloc(size_t(max_seq_ + 8) * 4, "tokens");
@@ -198,14 +199,34 @@ void Qwen35::alloc_state() {
   const int max_chunks = 1024;
   part_o_ = g.alloc(size_t(cfg_.hq) * max_chunks * cfg_.head_dim * 4);
   part_ml_ = g.alloc(size_t(cfg_.hq) * max_chunks * 2 * 4);
-  rlog_ = g.alloc(size_t(std::max(cfg_.experts, 1)) * 4);
-  slog_ = g.alloc(16);
   eidx_ = g.alloc(64 * 4);
   ewts_ = g.alloc(64 * 4);
   eh_ = g.alloc(size_t(cfg_.top_k + 1) * std::max(cfg_.moe_I, cfg_.shared_I) * 4 + 16);
   cand_v_ = g.alloc(size_t(cfg_.vocab / 2048 + 2) * 64 * 4);
   cand_i_ = g.alloc(size_t(cfg_.vocab / 2048 + 2) * 64 * 4);
   sprob_ = g.alloc(64 * 4);
+  {
+    const size_t P = size_t(T) * std::max(cfg_.top_k, 1);
+    const int I = std::max({cfg_.moe_I, cfg_.shared_I, cfg_.dense_I, 1});
+    const int W = std::max({D, VD, cfg_.hq * cfg_.head_dim}); // widest half input row
+    xh_ = g.alloc(size_t(T) * W * 2, "xh");
+    hh_ = g.alloc(size_t(T) * W * 2, "hh");
+    ridx_ = g.alloc(P * 4);
+    rwts_ = g.alloc(size_t(T) * (cfg_.top_k + 1) * 4 + 16);
+    spair_ = g.alloc(P * 4);
+    stok_ = g.alloc(P * 4);
+    tiles_ = g.alloc((P + size_t(std::max(cfg_.experts, 1)) + 1) * 3 * 4);
+    ntiles_ = g.alloc(16);
+    hg_ = g.alloc(P * I * 4);
+    hu_ = g.alloc(P * I * 4);
+    hhalf_ = g.alloc(P * I * 2);
+    yd_ = g.alloc(P * D * 4);
+    sgb_ = g.alloc(size_t(T) * I * 4);
+    sub_ = g.alloc(size_t(T) * I * 4);
+    ys_ = g.alloc(size_t(T) * D * 4);
+    rlog_ = g.alloc(size_t(T) * std::max(cfg_.experts, 1) * 4);
+    slog_ = g.alloc(size_t(T) * 4 + 16);
+  }
   size_t state_bytes = 0;
   for (int i = 0; i < cfg_.layers; ++i) {
     if (cfg_.is_linear[i]) {
@@ -389,7 +410,13 @@ void Qwen35::encode_step(Encoder& e, int pos, const SamplingParams& sp, uint32_t
     else fatal("dense MLP not implemented yet");
   }
   if (!sample) return;
-  enc_qmv(e, lm_head_, x_, logits_, nullptr, final_norm_);
+  enc_sample(e, x_, pos + 1, sp, step);
+}
+
+void Qwen35::enc_sample(Encoder& e, const Buffer& xrow, int out_index, const SamplingParams& sp, uint32_t step) {
+  static Pipeline st1 = Gpu::get().pipeline("topk_stage1");
+  static Pipeline st2 = Gpu::get().pipeline("sample_stage2");
+  enc_qmv(e, lm_head_, xrow, logits_, nullptr, final_norm_);
   // stage 2 holds 4 candidates per thread (4096): 122 threadgroups x 32 fits
   uint32_t K = sp.temperature > 0 ? uint32_t(std::clamp(sp.top_k <= 0 ? 32 : sp.top_k, 1, 32)) : 1u;
   kp::TopkStage ts{uint32_t(cfg_.vocab), K, 2048};
@@ -398,11 +425,152 @@ void Qwen35::encode_step(Encoder& e, int pos, const SamplingParams& sp, uint32_t
   e.buf(0, logits_); e.buf(1, cand_v_); e.buf(2, cand_i_);
   e.val(3, ts);
   e.dispatch(ntg, 1, 1, 256);
-  kp::Sample sp2{ntg * K, K, sp.temperature, sp.top_p, sp.seed, step, uint32_t(pos + 1)};
+  kp::Sample sp2{ntg * K, K, sp.temperature, sp.top_p, sp.seed, step, uint32_t(out_index)};
   e.use(st2);
   e.buf(0, cand_v_); e.buf(1, cand_i_); e.buf(2, tok_); e.buf(3, sprob_);
   e.val(4, sp2);
   e.dispatch(1, 1, 1, 1024);
+}
+
+// ---- prefill ----
+static Pipeline pipe(const std::string& n) {
+  static std::unordered_map<std::string, Pipeline> cache;
+  auto it = cache.find(n);
+  if (it == cache.end()) it = cache.emplace(n, Gpu::get().pipeline(n)).first;
+  return it->second;
+}
+
+void Qwen35::enc_rows_half(Encoder& e, const Buffer& x, const Tensor* norm, const Buffer& y, int T, int D) {
+  e.use(pipe("rows_to_half"));
+  kp::Rows p{uint32_t(D), norm ? 1u : 0u, cfg_.eps};
+  e.buf(0, x);
+  e.buf(1, norm ? norm->buf : x);
+  e.buf(2, y);
+  e.val(3, p);
+  e.dispatch(T, 1, 1, 256);
+}
+
+void Qwen35::enc_qmm(Encoder& e, const QLinear& L, const Buffer& xh, const Buffer& y, int M, bool add) {
+  const bool big = M > 32;
+  const int BM = big ? 64 : 32, BN = big ? 64 : 32;
+  std::string n = "qmm_b" + std::to_string(L.bits) + (big ? "_m64_n64" : "_m32_n32");
+  e.use(pipe(n));
+  kp::Qmm p{uint32_t(M), L.N, L.K, L.K, L.N, add ? 1u : 0u, uint32_t(L.gs), 0, 0};
+  e.buf(0, xh); e.buf(1, L.w->buf); e.buf(2, L.s->buf); e.buf(3, L.b->buf); e.buf(4, y);
+  e.val(5, p);
+  e.dispatch((L.N + BN - 1) / BN, (M + BM - 1) / BM, 1, 128);
+}
+
+void Qwen35::enc_qmm_moe(Encoder& e, const QLinear& L, const Buffer& xh, const Buffer& y, const Buffer& xrows,
+                         const Buffer& yrows, int P, int bm) {
+  std::string n = "qmm_moe_b4_m" + std::to_string(bm) + "_n64";
+  e.use(pipe(n));
+  // expert matrices are stacked [E, N, K]: strides in words / groups
+  uint32_t wstride = L.N * (L.K * L.bits / 32), sstride = L.N * (L.K / L.gs);
+  kp::Qmm p{uint32_t(P), L.N, L.K, L.K, L.N, 0, uint32_t(L.gs), wstride, sstride};
+  e.buf(0, xh); e.buf(1, L.w->buf); e.buf(2, L.s->buf); e.buf(3, L.b->buf); e.buf(4, y);
+  e.val(5, p);
+  e.buf(6, tiles_); e.buf(7, ntiles_); e.buf(8, xrows); e.buf(9, yrows);
+  uint32_t max_tiles = uint32_t((P + bm - 1) / bm + cfg_.experts);
+  e.dispatch((L.N + 63) / 64, max_tiles, 1, 128);
+}
+
+void Qwen35::enc_moe_prefill(Encoder& e, const Layer& L, int T) {
+  const int D = cfg_.hidden, k = cfg_.top_k, P = T * k;
+  enc_rows_half(e, x_, L.post_norm, xh_, T, D);
+  enc_qmm(e, L.router, xh_, rlog_, T, false);
+  enc_qmm(e, L.shared_gate, xh_, slog_, T, false);
+  kp::Topk tp{uint32_t(cfg_.experts), uint32_t(k), cfg_.norm_topk ? 1u : 0u};
+  e.use(pipe("moe_topk_rows"));
+  e.buf(0, rlog_); e.buf(1, slog_); e.buf(2, ridx_); e.buf(3, rwts_);
+  e.val(4, tp);
+  e.dispatch(T, 1, 1, 32);
+  const int bm = P / cfg_.experts >= 24 ? 32 : 16;
+  kp::Bucket bp{uint32_t(P), uint32_t(k), uint32_t(cfg_.experts), uint32_t(bm)};
+  e.use(pipe("moe_bucket"));
+  e.buf(0, ridx_); e.buf(1, spair_); e.buf(2, stok_); e.buf(3, tiles_); e.buf(4, ntiles_);
+  e.val(5, bp);
+  e.dispatch(1, 1, 1, 1024);
+  enc_qmm_moe(e, L.eg, xh_, hg_, stok_, spair_, P, bm);
+  enc_qmm_moe(e, L.eu, xh_, hu_, stok_, spair_, P, bm);
+  uint32_t n = uint32_t(P * cfg_.moe_I);
+  e.use(pipe("swiglu_half"));
+  e.buf(0, hg_); e.buf(1, hu_); e.buf(2, hhalf_); e.val(3, n);
+  e.dispatch((n + 255) / 256, 1, 1, 256);
+  enc_qmm_moe(e, L.ed, hhalf_, yd_, spair_, spair_, P, bm);
+  // shared expert on all rows
+  enc_qmm(e, L.sg, xh_, sgb_, T, false);
+  enc_qmm(e, L.su, xh_, sub_, T, false);
+  uint32_t ns = uint32_t(T * cfg_.shared_I);
+  e.use(pipe("swiglu_half"));
+  e.buf(0, sgb_); e.buf(1, sub_); e.buf(2, hh_); e.val(3, ns);
+  e.dispatch((ns + 255) / 256, 1, 1, 256);
+  enc_qmm(e, L.sd, hh_, ys_, T, false);
+  kp::Combine cp{uint32_t(D), uint32_t(k)};
+  e.use(pipe("moe_combine"));
+  e.buf(0, yd_); e.buf(1, ys_); e.buf(2, rwts_); e.buf(3, x_);
+  e.val(4, cp);
+  e.dispatch((D / 4 + 63) / 64, T, 1, 64);
+}
+
+void Qwen35::encode_prefill(Encoder& e, int pos0, int T, const SamplingParams& sp, uint32_t step, bool sample) {
+  if (T > tmax_) fatal("prefill chunk %d > %d", T, tmax_);
+  if (pos0 + T >= max_seq_) fatal("context full (%d)", max_seq_);
+  const int D = cfg_.hidden;
+  kp::Embed ep{uint32_t(D), uint32_t(embed_.gs), uint32_t(pos0)};
+  e.use(pipe("embed_q4"));
+  e.buf(0, embed_.w->buf); e.buf(1, embed_.s->buf); e.buf(2, embed_.b->buf); e.buf(3, tok_); e.buf(4, x_);
+  e.val(5, ep);
+  e.dispatch((D / 8 + 63) / 64, T, 1, 64);
+  const uint32_t C = 2 * cfg_.lin_hk * cfg_.lin_dk + cfg_.lin_hv * cfg_.lin_dv;
+  const int VD = cfg_.lin_hv * cfg_.lin_dv;
+  for (int i = 0; i < cfg_.layers; ++i) {
+    const Layer& L = layers_[i];
+    enc_rows_half(e, x_, L.in_norm, xh_, T, D);
+    if (L.linear) {
+      enc_qmm(e, L.qkv, xh_, qkv_, T, false);
+      enc_qmm(e, L.z, xh_, zb_, T, false);
+      enc_qmm(e, L.b, xh_, bb_, T, false);
+      enc_qmm(e, L.a, xh_, ab_, T, false);
+      kp::GdnPrep pp{uint32_t(T), uint32_t(cfg_.lin_hk), uint32_t(cfg_.lin_hv), C};
+      e.use(pipe("gdn_prep"));
+      e.buf(0, qkv_); e.buf(1, ab_); e.buf(2, bb_); e.buf(3, conv_state_[i]);
+      e.buf(4, L.conv_w->buf); e.buf(5, L.A_log->buf); e.buf(6, L.dt_bias->buf);
+      e.buf(7, gq_); e.buf(8, gk_); e.buf(9, gv_); e.buf(10, gg_); e.buf(11, gbeta_);
+      e.val(12, pp);
+      e.dispatch(C / 128, 1, 1, 128);
+      kp::GdnStep sp2{uint32_t(T), uint32_t(cfg_.lin_hk), uint32_t(cfg_.lin_hv), cfg_.eps};
+      e.use(pipe("gdn_step"));
+      e.buf(0, gq_); e.buf(1, gk_); e.buf(2, gv_); e.buf(3, gg_); e.buf(4, gbeta_);
+      e.buf(5, rec_state_[i]); e.buf(6, zb_); e.buf(7, L.gnorm->buf); e.buf(8, gout_);
+      e.val(9, sp2);
+      e.dispatch(cfg_.lin_hv, 1, 1, 1024);
+      enc_rows_half(e, gout_, nullptr, hh_, T, VD);
+      enc_qmm(e, L.out, hh_, x_, T, true);
+    } else {
+      enc_qmm(e, L.q, xh_, qg_, T, false);
+      enc_qmm(e, L.k, xh_, kr_, T, false);
+      enc_qmm(e, L.v, xh_, vr_, T, false);
+      kp::AttnPrep ap{uint32_t(T), uint32_t(cfg_.hq), uint32_t(cfg_.hkv), uint32_t(cfg_.head_dim),
+                      uint32_t(cfg_.rot_dims), uint32_t(pos0), uint32_t(max_seq_), cfg_.eps, cfg_.theta};
+      e.use(pipe("attn_prep"));
+      e.buf(0, qg_); e.buf(1, kr_); e.buf(2, vr_); e.buf(3, L.q_norm->buf); e.buf(4, L.k_norm->buf);
+      e.buf(5, qo_); e.buf(6, kc_[i]); e.buf(7, vc_[i]);
+      e.val(8, ap);
+      e.dispatch(cfg_.hq + 2 * cfg_.hkv, T, 1, cfg_.head_dim);
+      kp::AttnPref fp{uint32_t(T), uint32_t(cfg_.hq), uint32_t(cfg_.hkv), uint32_t(pos0), uint32_t(max_seq_),
+                      1.0f / std::sqrt(float(cfg_.head_dim))};
+      e.use(pipe("attn_prefill"));
+      e.buf(0, qo_); e.buf(1, kc_[i]); e.buf(2, vc_[i]); e.buf(3, qg_); e.buf(4, attn_out_);
+      e.val(5, fp);
+      e.dispatch((T + 3) / 4, cfg_.hkv, 1, 128);
+      enc_rows_half(e, attn_out_, nullptr, hh_, T, cfg_.hq * cfg_.head_dim);
+      enc_qmm(e, L.o, hh_, x_, T, true);
+    }
+    if (cfg_.moe) enc_moe_prefill(e, L, T);
+    else fatal("dense MLP not implemented yet");
+  }
+  if (sample) enc_sample(e, x_.view(size_t(T - 1) * D * 4, size_t(D) * 4), pos0 + T, sp, step);
 }
 
 Buffer Qwen35::debug_buf(const std::string& n) {

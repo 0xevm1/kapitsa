@@ -61,7 +61,7 @@ struct SamplingParams {
 
 class Qwen35 {
  public:
-  explicit Qwen35(const std::string& model_dir, int max_seq = 32768);
+  explicit Qwen35(const std::string& model_dir, int max_seq = 32768, int prefill_chunk = 512);
   const Qwen35Config& config() const { return cfg_; }
 
   // Clears recurrent state (KV entries are overwritten by position, so they need no reset).
@@ -69,6 +69,10 @@ class Qwen35 {
   // Encodes one decode step for the token at tokens[pos]. With `sample`, computes logits and
   // writes the sampled id to tokens[pos+1]; without, only advances the state (prompt tokens).
   void encode_step(Encoder& e, int pos, const SamplingParams& sp, uint32_t step, bool sample = true);
+  // Encodes T prompt tokens tokens[pos0 .. pos0+T) as one batch (T <= prefill_chunk).
+  // With `sample`, also samples tokens[pos0+T] from the last position.
+  void encode_prefill(Encoder& e, int pos0, int T, const SamplingParams& sp, uint32_t step, bool sample);
+  int prefill_chunk() const { return tmax_; }
   int* tokens() { return tok_.as<int>(); }
   float* logits() { return logits_.as<float>(); }
   // Debug: copy of the residual stream after the last step.
@@ -90,6 +94,13 @@ class Qwen35 {
   void enc_gdn(Encoder& e, int li, const Layer& L);
   void enc_attn(Encoder& e, int li, const Layer& L, int pos);
   void enc_moe(Encoder& e, const Layer& L);
+  // prefill
+  void enc_rows_half(Encoder& e, const Buffer& x, const Tensor* norm, const Buffer& y, int T, int D);
+  void enc_qmm(Encoder& e, const QLinear& L, const Buffer& xh, const Buffer& y, int M, bool add);
+  void enc_qmm_moe(Encoder& e, const QLinear& L, const Buffer& xh, const Buffer& y, const Buffer& xrows,
+                   const Buffer& yrows, int P, int bm);
+  void enc_sample(Encoder& e, const Buffer& xrow, int out_index, const SamplingParams& sp, uint32_t step);
+  void enc_moe_prefill(Encoder& e, const Layer& L, int T);
 
   std::string dir_;
   std::string prefix_;
@@ -99,6 +110,7 @@ class Qwen35 {
   const Tensor* final_norm_ = nullptr;
   QLinear embed_, lm_head_;
   int max_seq_;
+  int tmax_;
 
   // state
   Buffer tok_, x_, logits_;
@@ -106,6 +118,8 @@ class Qwen35 {
   Buffer qg_, kr_, vr_, qo_, attn_out_, part_o_, part_ml_;
   Buffer rlog_, slog_, eidx_, ewts_, eh_;
   Buffer cand_v_, cand_i_, sprob_;
+  // prefill-only
+  Buffer xh_, hh_, ridx_, rwts_, spair_, stok_, tiles_, ntiles_, hg_, hu_, hhalf_, yd_, sgb_, sub_, ys_;
   std::vector<Buffer> conv_state_, rec_state_, kc_, vc_;
 };
 

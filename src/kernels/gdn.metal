@@ -143,3 +143,27 @@ struct GdnStepParams {
   }
   for (int r = 0; r < 4; ++r) *(device float4*)(S + (sg * 4 + r) * D + lane * 4) = st[r];
 }
+
+// ---- Prefill helpers ----
+// Y[t, :] = half(rmsnorm(X[t, :]) * w) when w is given (norm=1), else half(X[t, :]).
+// grid: T threadgroups x 256 threads.
+struct RowsParams {
+  uint D;
+  uint norm;
+  float eps;
+};
+[[kernel]] void rows_to_half(const device float* X [[buffer(0)]], const device bfloat* w [[buffer(1)]],
+                             device half* Y [[buffer(2)]], constant RowsParams& p [[buffer(3)]],
+                             uint t [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+                             uint ntg [[threads_per_threadgroup]]) {
+  threadgroup float scratch[32];
+  const device float* x = X + t * p.D;
+  float inv = 1.0f;
+  if (p.norm) {
+    float ss = 0.0f;
+    for (uint i = tid; i < p.D; i += ntg) ss += x[i] * x[i];
+    ss = tg_sum(ss, scratch, tid, ntg);
+    inv = metal::precise::rsqrt(ss / float(p.D) + p.eps);
+  }
+  for (uint i = tid; i < p.D; i += ntg) Y[t * p.D + i] = half(p.norm ? x[i] * inv * float(w[i]) : x[i]);
+}

@@ -165,3 +165,120 @@ struct MoeParams {
     if (lane == 0 && row0 + r < p.D) x[row0 + r] += v;
   }
 }
+
+// ---- Prefill MoE helpers ----
+
+// Router top-k for T tokens: one simdgroup per token (grid x = T, 32 threads).
+[[kernel]] void moe_topk_rows(const device float* logits [[buffer(0)]], const device float* shared [[buffer(1)]],
+                              device uint* idx [[buffer(2)]], device float* wts [[buffer(3)]],
+                              constant TopkParams& p [[buffer(4)]], uint t [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+  const uint per = p.E / 32;
+  float v[16];
+  float mx = -INFINITY;
+  for (uint i = 0; i < per; ++i) {
+    v[i] = logits[t * p.E + lane * per + i];
+    mx = max(mx, v[i]);
+  }
+  mx = simd_max(mx);
+  float sum = 0.0f;
+  for (uint i = 0; i < per; ++i) {
+    v[i] = metal::precise::exp(v[i] - mx);
+    sum += v[i];
+  }
+  sum = simd_sum(sum);
+  for (uint i = 0; i < per; ++i) v[i] /= sum;
+  uint taken = 0;
+  float sel_sum = 0.0f;
+  float my_w[16];
+  uint my_i[16];
+  for (uint r = 0; r < p.k; ++r) {
+    float best = -1.0f;
+    uint bi = 0xffffffff;
+    for (uint i = 0; i < per; ++i)
+      if (!(taken & (1u << i)) && v[i] > best) { best = v[i]; bi = lane * per + i; }
+    float gbest = simd_max(best);
+    uint win = simd_min(best == gbest ? bi : 0xffffffff);
+    if (win != 0xffffffff && win / per == lane) taken |= 1u << (win % per);
+    my_w[r] = gbest;
+    my_i[r] = win;
+    sel_sum += gbest;
+  }
+  if (lane == 0) {
+    for (uint r = 0; r < p.k; ++r) {
+      idx[t * p.k + r] = my_i[r];
+      wts[t * (p.k + 1) + r] = p.norm ? my_w[r] / sel_sum : my_w[r];
+    }
+    wts[t * (p.k + 1) + p.k] = sigmoid(shared[t]);
+  }
+}
+
+// Groups the T*k (token, slot) pairs by expert. One threadgroup of 1024 threads.
+// Outputs: sorted_pair[P] (pair ids grouped by expert), sorted_tok[P] (= pair / k),
+// tiles[3*i] = (expert, begin, end) row ranges of at most BM sorted rows, ntiles[0].
+struct BucketParams {
+  uint P;   // pairs = T * k
+  uint k;
+  uint E;
+  uint BM;
+};
+
+[[kernel]] void moe_bucket(const device uint* idx [[buffer(0)]], device uint* sorted_pair [[buffer(1)]],
+                           device uint* sorted_tok [[buffer(2)]], device uint* tiles [[buffer(3)]],
+                           device uint* ntiles [[buffer(4)]], constant BucketParams& p [[buffer(5)]],
+                           uint tid [[thread_position_in_threadgroup]], uint ntg [[threads_per_threadgroup]]) {
+  threadgroup atomic_uint cnt[512];
+  threadgroup uint off[513];
+  for (uint e = tid; e < p.E; e += ntg) atomic_store_explicit(&cnt[e], 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i = tid; i < p.P; i += ntg) atomic_fetch_add_explicit(&cnt[idx[i]], 1u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    uint acc = 0, nt = 0;
+    for (uint e = 0; e < p.E; ++e) {
+      uint c = atomic_load_explicit(&cnt[e], memory_order_relaxed);
+      off[e] = acc;
+      for (uint r = 0; r < c; r += p.BM) {
+        tiles[nt * 3 + 0] = e;
+        tiles[nt * 3 + 1] = acc + r;
+        tiles[nt * 3 + 2] = acc + min(r + p.BM, c);
+        ++nt;
+      }
+      acc += c;
+    }
+    ntiles[0] = nt;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint e = tid; e < p.E; e += ntg) atomic_store_explicit(&cnt[e], 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i = tid; i < p.P; i += ntg) {
+    uint e = idx[i];
+    uint pos = off[e] + atomic_fetch_add_explicit(&cnt[e], 1u, memory_order_relaxed);
+    sorted_pair[pos] = i;
+    sorted_tok[pos] = i / p.k;
+  }
+}
+
+// h[row] = silu(g[row]) * u[row] as half (rows of width I). grid: rows x I/4 threads.
+[[kernel]] void swiglu_half(const device float* g [[buffer(0)]], const device float* u [[buffer(1)]],
+                            device half* h [[buffer(2)]], constant uint& n [[buffer(3)]],
+                            uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  h[i] = half(silu(g[i]) * u[i]);
+}
+
+// x[t, :] += sum_s wts[t, s] * y[t*k + s, :] + wts[t, k] * ys[t, :]. grid: (D/4, T)
+struct CombineParams {
+  uint D;
+  uint k;
+};
+[[kernel]] void moe_combine(const device float* y [[buffer(0)]], const device float* ys [[buffer(1)]],
+                            const device float* wts [[buffer(2)]], device float* x [[buffer(3)]],
+                            constant CombineParams& p [[buffer(4)]], uint2 gid [[thread_position_in_grid]]) {
+  uint d4 = gid.x, t = gid.y;
+  if (d4 >= p.D / 4) return;
+  float4 acc = 0.0f;
+  for (uint s = 0; s < p.k; ++s) acc += wts[t * (p.k + 1) + s] * ((const device float4*)(y + (t * p.k + s) * p.D))[d4];
+  acc += wts[t * (p.k + 1) + p.k] * ((const device float4*)(ys + t * p.D))[d4];
+  ((device float4*)(x + t * p.D))[d4] += acc;
+}
