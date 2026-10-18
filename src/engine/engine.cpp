@@ -201,7 +201,11 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
       defaults_.top_k = gc.contains("top_k") && gc["top_k"].is_number() ? gc["top_k"].get<int>() : 0;
     }
   };
-  if (Dory::is_model(opts_.model_dir)) {
+  if (Qwen4Exp::is_model(opts_.model_dir)) {
+    auto m = std::make_unique<Qwen4Exp>(opts_.model_dir, opts_.prefill_chunk);  // Qwen3.8-Flash-Next
+    q35_ = m.get();
+    model_ = std::move(m);
+  } else if (Dory::is_model(opts_.model_dir)) {
     LoopKv kv = LoopKv::last_loop;
     if (!opts_.loop_kv.empty() && !parse_loop_kv(opts_.loop_kv, &kv))
       fatal("--loop-kv: last-loop or per-loop, not \"%s\"", opts_.loop_kv.c_str());
@@ -247,7 +251,7 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
   if (opts_.spec_depth < 0) opts_.spec_depth = q35_ ? q35_->default_spec_depth() : 0;
   spec_ = q35_ && opts_.spec_depth > 0 && q35_->has_mtp();
   if (opts_.spec_depth > Qwen35::kMaxMtpRows - 1) opts_.spec_depth = Qwen35::kMaxMtpRows - 1;
-  if (q35_ && !lp.dflash_off && lp.dflash_left_out.empty()) {
+  if (q35_ && q35_->block_drafter_ok() && !lp.dflash_off && lp.dflash_left_out.empty()) {
     const std::string& dir = lp.dflash;
     if (dir.empty()) {
       logi("DFlash2: no drafter found for %s (looked next to the model and in ~/.cache/nace-infer-models/drafters)",
@@ -339,9 +343,9 @@ size_t default_mem_budget() {
   return rws - std::max<size_t>(size_t(512) << 20, rws / 25);
 }
 
-// The model's memory plan from its headers: a Nemotron-H or a Qwen3.5-family folder.
-static MemPlan model_plan(const std::string& model_dir, int prefill_chunk) {
+MemPlan model_plan(const std::string& model_dir, int prefill_chunk) {
   if (Dory::is_model(model_dir)) return Dory::plan(model_dir, prefill_chunk);
+  if (Qwen4Exp::is_model(model_dir)) return Qwen4Exp::plan(model_dir, prefill_chunk);
   return NemotronH::is_model(model_dir) ? NemotronH::plan(model_dir, prefill_chunk) : Qwen35::plan(model_dir, prefill_chunk);
 }
 static size_t model_ane_bytes(const std::string& model_dir, const MemPlan& p) {
@@ -383,7 +387,7 @@ LoadPlan plan_load(const std::string& model_dir, const std::string& dflash, bool
         }
       }
     }
-  } else if (!lp.dflash_off) {
+  } else if (!lp.dflash_off && !Qwen4Exp::is_model(model_dir)) {  // (no block drafter binds to Qwen3.8-Flash-Next)
     lp.dflash = lp.dflash_auto ? DFlash2::find(model_dir, Qwen35::read_config(model_dir)) : want;
     if (!lp.dflash.empty()) {
       // auto: a drafter that would keep one conversation from its full context is left out (MTP or plain decoding
@@ -1957,7 +1961,7 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     Buffer hsrc = q35_->hidden_rows();
     auto park = [&] {
       if (hsrc.mtl != q35_->hidden_rows().mtl) return;  // parked already
-      const size_t row = size_t(q35_->config().hidden) * 4;
+      const size_t row = q35_->hidden_row_bytes();
       if (!slot.park_h) slot.park_h = g.alloc(size_t(Qwen35::kMaxVerify) * row, "park_hidden");
       auto ep = g.begin();
       q35_->encode_copy(*ep, hsrc.view(size_t(h_row0) * row, size_t(c) * row), slot.park_h.view(0, size_t(c) * row));

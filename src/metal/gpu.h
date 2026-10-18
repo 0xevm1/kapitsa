@@ -55,6 +55,8 @@ class Gpu {
   Buffer wrap(void* ptr, size_t bytes, const char* label = nullptr, bool tracked = false);
   // A new MTLSharedEvent (retained; id<MTLSharedEvent>), for ordering GPU work with the ANE.
   void* new_shared_event();
+  // Sets the event's value from the CPU (a GPU wait_event on it proceeds once it reaches the waited value)
+  static void signal_event_cpu(void* event, uint64_t value);
   void release(Buffer& b);
 
   // Compiles the embedded kernel library on first use. Extra source can be appended (tests).

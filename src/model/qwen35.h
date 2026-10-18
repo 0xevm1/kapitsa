@@ -48,7 +48,8 @@ struct QLinear {
 bool format_supported(int bits, int gs);
 std::string format_name(int bits, int gs);  // "bf16", "4-bit group 64", ...
 // The per-row MoE kernel (gate/up or down) for routed experts e and shared expert s, "" if none exists.
-std::string moe_rows_kernel(bool gate_up, const QLinear& e, const QLinear& s);
+// wide: the experts' staged h exceeds 4608 floats (Qwen35::moe_wide), so the down kernel's _w form ("" if none).
+std::string moe_rows_kernel(bool gate_up, const QLinear& e, const QLinear& s, bool wide = false);
 
 struct Qwen35Config {
   int hidden = 0, layers = 0, vocab = 0;
@@ -234,7 +235,7 @@ class Qwen35 : public Model {
   // 149.0 / 142.1, 3 153.7 / 147.8, 4 157.6 / 147.5, 5 155.6 / 142.4 tok/s (512 tokens); 4B bf16 depth 1 45.8 / 43.0, 2
   // 60.7 / 53.7, 3 65.9 / 56.2, 4 69.4 / 58.1, 5 69.7 / 57.6, 6 70.0 / 57.2 (256); 27B 4-bit depth 2 32.7 / 31.0, 4
   // 39.3 / 34.9, 6 40.0 / 35.1 (128 tokens; depth 2 on the small-batch kernels: 29.1).
-  int default_spec_depth() const { return cfg_.moe ? 1 : 4; }
+  virtual int default_spec_depth() const { return cfg_.moe ? 1 : 4; }
   // Rows per verify (pending token + up to 7 drafts). R <= 2 (and R <= 4 on MoE models) runs the small-batch
   // kernels; more rows (NI_V8=1: from 2; NI_V8=0: from 5) the 8-row MMA path (qwen35_v8.cpp).
   static constexpr int kMaxVerify = 8;
@@ -243,13 +244,14 @@ class Qwen35 : public Model {
   // mpos0 + r; they extend the MTP cache. The last row's post-norm hidden is left in mtp_post()
   // row R-1; with draft_out >= 0 the draft for the next token goes to tokens[draft_out].
   // h_trunk: `h` holds trunk hidden states (pre-norm); false for the MTP's own chained output.
-  void encode_mtp(Encoder& e, Seq& s, int mpos0, int R, int tok0, const Buffer& h, int h_row0, int draft_out,
-                  bool h_trunk = true);
+  virtual void encode_mtp(Encoder& e, Seq& s, int mpos0, int R, int tok0, const Buffer& h, int h_row0, int draft_out,
+                          bool h_trunk = true);
   // Trunk forward of tokens[pos .. pos+R) (R <= kMaxVerify) without committing the recurrent
   // state: the rows go to the tape; samples() gets one sampled token per row and hidden_rows()
   // their pre-norm hidden states. commit_rows() then picks how many of them were accepted.
   // v8: take the 8-row path for any R >= 1 (a block drafter verifying fewer than 4 proposals).
-  void encode_verify(Encoder& e, Seq& s, int pos, int R, const SamplingParams& sp, uint32_t step, bool v8 = false);
+  virtual void encode_verify(Encoder& e, Seq& s, int pos, int R, const SamplingParams& sp, uint32_t step,
+                             bool v8 = false);
   // Batched decode: one 8-row verify pass over the rows of several sequences. Group g verifies tokens[pos .. pos + R)
   // of its sequence (folding its pending rows first, as encode_verify does); the projections, the MLP / MoE and the
   // LM head run once over all the rows (sum of R <= 8), the per-sequence parts (GDN conv, recurrence and tape;
@@ -270,14 +272,16 @@ class Qwen35 : public Model {
   void encode_verify_multi(Encoder& e, const std::vector<VerifyGroup>& groups);
   void commit_rows(Seq& s, int n) { s.n_pend = n; }
   // Folds pending rows into the recurrent state (before plain decode/prefill or a checkpoint).
-  void encode_flush(Encoder& e, Seq& s);
+  virtual void encode_flush(Encoder& e, Seq& s);
   // MTP history for prompt rows [pos0, pos0 + R) using the trunk hidden states of the last
   // prefill chunk (row offset h_row0 in hidden_rows()); tokens[i + 1] must be known.
-  void encode_mtp_prefill(Encoder& e, Seq& s, int pos0, int R, int h_row0);
+  virtual void encode_mtp_prefill(Encoder& e, Seq& s, int pos0, int R, int h_row0);
   const int* samples() { return samp_.as<int>(); }
   // MoE models, after an 8-row verify: distinct routed experts of each layer (0 for dense layers)
   const uint32_t* verify8_experts() { return v8ustat_ ? v8ustat_.as<uint32_t>() : nullptr; }
   Buffer hidden_rows() { return x_; }
+  // bytes of one hidden_rows() row as encode_mtp reads it (Qwen3.8-Flash-Next's rows hold its 4 streams)
+  virtual size_t hidden_row_bytes() const { return size_t(cfg_.hidden) * 4; }
   Buffer mtp_post() { return mtp_post_; }
   // GPU copy of src into dst (the smaller of the two sizes, a multiple of 16 bytes), in order with the work in `e`
   // (the engine keeps a sequence's MTP hidden rows aside while another request's passes reuse hidden_rows())
@@ -327,13 +331,20 @@ class Qwen35 : public Model {
 
   // Logits of rows [0, T) of the last prefill chunk (teacher-forced scoring, tools/ni_eval): final norm + LM head
   // on the prefill GEMM -> out [T, vocab] fp32.
-  void encode_logits_rows(Encoder& e, int T, const Buffer& out);
+  virtual void encode_logits_rows(Encoder& e, int T, const Buffer& out);
   // Token embedding rows tokens[tok_off .. tok_off + T) -> out [T, hidden] (fp32), any embedding format.
   void enc_embed(Encoder& e, const Buffer& tokens, int tok_off, int T, const Buffer& out);
   // The weight formats this model runs (log line), e.g. "bf16" or "4-bit group 64 (8-bit: router, shared gate)"
-  std::string formats_summary() const;
+  virtual std::string formats_summary() const;
+  // The block drafter (DFlash2) binds to this layout (Qwen3.5-family trunks; not Qwen3.8-Flash-Next's)
+  virtual bool block_drafter_ok() const { return true; }
 
- private:
+ protected:
+  // Subclasses (Qwen4Exp) that load the checkpoint themselves: members only, nothing read
+  struct NoLoad {};
+  Qwen35(const std::string& model_dir, int prefill_chunk, NoLoad);
+  void check_shapes() const;
+  bool moe_wide() const;
   void load_config(const std::string& dir);
   struct ActBuf {
     Buffer Qwen35::*member;
@@ -383,9 +394,11 @@ class Qwen35 : public Model {
                    const Buffer& yrows, int P, int bm);
   void enc_sample(Encoder& e, Seq& s, const Buffer& xrow, int out_index, const SamplingParams& sp, uint32_t step);
   void enc_copy(Encoder& e, const Buffer& src, const Buffer& dst);
-  void enc_moe_prefill(Encoder& e, const Layer& L, int T, const Buffer& x);
+  // xh_ready: xh_ already holds the layer's half input rows (Qwen4Exp: the gated residual's mix), x only receives the
+  // output (x += moe); else x is normed into xh_ first
+  void enc_moe_prefill(Encoder& e, const Layer& L, int T, const Buffer& x, bool xh_ready = false);
   void enc_attn_prefill(Encoder& e, const Buffer& kc, const Buffer& vc, int T, int pos0, int cap);
-  bool enc_moe_prefill_fused(Encoder& e, const Layer& L, int T, const Buffer& x);
+  bool enc_moe_prefill_fused(Encoder& e, const Layer& L, int T, const Buffer& x, bool xh_ready = false);
   // NI_GDN_PAR=1: GDN conv/prep, recurrence and gated norm of T rows; leaves the half rows in hh_
   void enc_gdn_prefill_par(Encoder& e, Seq& s, int li, const Layer& L, int T, Checkpoint* snap = nullptr,
                            int snap_row = 0);
@@ -404,7 +417,7 @@ class Qwen35 : public Model {
   void enc_topk_rows(Encoder& e, uint32_t E, uint32_t k, bool norm, int T);
   void enc_qmr_short(Encoder& e, const std::vector<SegQ>& segs, const Buffer& xh, int M);
   bool enc_qmms_gu(Encoder& e, const QLinear& G, const QLinear& U, const Buffer& xh, const Buffer& h, int T);
-  bool enc_moe_prefill_small(Encoder& e, const Layer& L, int T, const Buffer& x);
+  bool enc_moe_prefill_small(Encoder& e, const Layer& L, int T, const Buffer& x, bool xh_ready = false);
   void enc_mlp_prefill(Encoder& e, const Layer& L, int T, const Buffer& x);
   // ANE split (qwen35_ane.cpp)
   void init_ane();
@@ -455,7 +468,8 @@ class Qwen35 : public Model {
   // attn_prep_m's arguments beyond attn_prep's (a sequence with images: M-RoPE positions, buffers 9 and 10)
   static bool mrope(const Seq& s) { return s.rope_n > 0 || s.rope_delta != 0; }
   void enc_mrope_args(Encoder& e, const Seq& s);
-  void enc_moe_rows(Encoder& e, const Layer& L, int R, const Buffer& x, bool mtp_layer);
+  // in: the rows' (already normalized) input instead of norm(x); it must be xrn_ (Qwen4Exp)
+  void enc_moe_rows(Encoder& e, const Layer& L, int R, const Buffer& x, bool mtp_layer, const Buffer* in = nullptr);
   // ---- 8-row verify path (qwen35_v8.cpp) ----
   void v8_alloc();
   void encode_verify8(Encoder& e, Seq& s, int pos, int R, const SamplingParams& sp, uint32_t step);
@@ -500,7 +514,10 @@ class Qwen35 : public Model {
   std::vector<Buffer> owned_bufs_;
 
   size_t mem_budget_ = 0;
-  void grow_kv(Seq& s, int cap);
+  bool gdn_sigmoid_ = false;  // the gated norm's gate: sigmoid (Qwen3.8-Flash-Next), else silu
+  // 3-row verify GEMVs on the fp32 kernels instead of qmvht_t3_r4's half products (Qwen4Exp: accuracy first)
+  bool no_qmvh_ = false;
+  virtual void grow_kv(Seq& s, int cap);
   void enc_kv_regrow(Encoder& e, const Buffer& src, const Buffer& dst, int old_cap, int new_cap);
 
   std::unique_ptr<ane::FfnSplit> ane_;

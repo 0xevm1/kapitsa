@@ -227,6 +227,25 @@ const std::vector<CatalogModel>& catalog() {
             .companions = {mtp35(), dflash35()},
             .download_gb = 71.88},
        }},
+      // a 128 GB Mac's model, not in by_preference (src/server/main.cpp): never picked without --model
+      {.name = "qwen3.8-flash-next",
+       .aliases = {"flash-next", "flash"},
+       .title = "Qwen3.8-Flash-Next 180B-A7B",
+       .about = "Qwen's 180B MoE, 7B active: hyper-connections, sparse attention, a 32 GB n-gram table read from the SSD",
+       .brief = "Qwen 180B MoE: for 128 GB Macs",
+       .default_variant = "4bit",
+       .fallbacks = {},
+       .variants = {
+           // Nace AI's quantization of Qwen/Qwen3.8-Flash-Next @ de4b8e4d (bf16; tools/convert_qwen4_exp.py): the MTP
+           // head in mtp.safetensors, the n-gram table in ple.safetensors (mapped, outside GPU memory), vision bf16
+           {.name = "4bit",
+            .quant = "MLX affine 4-bit experts / DeltaNet / head, 6-bit attention / hyper-connections, 8-bit router / "
+                     "indexer / embedding, 4-bit n-gram table",
+            .repo = "nace-ai/Qwen3.8-Flash-Next-MLX-4bit",
+            .revision = "5d423f9f563c1f1b7ca7945b268e65c0b92b0eae",
+            .companions = {},
+            .download_gb = 105.86},
+       }},
       {.name = "nemotron-labs-dory1.0-4b",
        .aliases = {"dory", "dory-4b", "dory1.0-4b"},
        .title = "Nemotron-Labs Dory1.0 4B",

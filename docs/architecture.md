@@ -66,6 +66,10 @@ two candidates are within the batched pass's rounding of each other, and sampled
 | Weight formats | BF16 and supported affine quantizations | NVFP4, IQ2_XXS, Q8_0 and BF16 by tensor type |
 | Neural Engine prefill | Dense FFN portions | Mamba projections and shared-expert work |
 
+Qwen3.8-Flash-Next (`Qwen4Exp`) is a subclass of `Qwen35` that reuses its projections, DeltaNet, attention, experts,
+sampler and KV handling, and adds the 4-stream hyper-connection residual, the per-layer n-gram embedding (hashed and
+gathered on the CPU from a mapped table) and the sparse-attention indexer.
+
 Both implement `Model`: memory planning, sequence allocation, KV growth, recurrent checkpoints, prefill and decode.
 Speculative paths remain specialized: the engine also holds backend-specific pointers and drafter state. Adding a
 new architecture requires more than implementing `Model` if it needs a new drafter, tokenizer behavior or vision tower.
@@ -115,6 +119,7 @@ Neural Engine resources. `kapitsa doctor` uses the same planning logic to report
 | Request lifecycle, slots, turns, batched decoding and generation | [`src/engine/engine.cpp`](../src/engine/engine.cpp) |
 | Shared model contract and sequence state | [`src/model/model.h`](../src/model/model.h) |
 | Qwen backend and drafters | [`qwen35.h`](../src/model/qwen35.h), [`dflash2.h`](../src/model/dflash2.h) |
+| Qwen3.8-Flash-Next | [`qwen4_exp.h`](../src/model/qwen4_exp.h), [`ngram.h`](../src/model/ngram.h), [`qwen4.metal`](../src/kernels/qwen4.metal) |
 | Nemotron backend and drafters | [`nemotron_h.h`](../src/model/nemotron_h.h), [`nh_drafter.h`](../src/model/nh_drafter.h), [`lilicorr.h`](../src/model/lilicorr.h), [`dspark.h`](../src/model/dspark.h) |
 | Metal runtime and kernels | [`src/metal/`](../src/metal/), [`src/kernels/`](../src/kernels/) |
 | Neural Engine bridge and splits | [`src/ane/`](../src/ane/), [`nemotron_ane.h`](../src/model/nemotron_ane.h) |

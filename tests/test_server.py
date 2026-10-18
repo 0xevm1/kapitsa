@@ -49,6 +49,9 @@ def hosts_call(name, args):
         (name == "run_shell" and "/etc/hosts" in str(args.get("command", "")))
 
 
+hosts = "127.0.0.1 localhost\n255.255.255.255 broadcasthost\n::1 localhost\n"
+
+
 def hosts_result(name, args=None):
     """What a call on /etc/hosts returns: the file for read_file, `wc -l`'s output through run_shell."""
     if name != "run_shell":
@@ -262,6 +265,12 @@ def cli_checks(kapitsa):
     s.close()
     rc, _, err = run("serve", "--model", "nonsense")
     check("cli: serve with an unknown model", rc == 2 and "Unknown model" in err, err)
+    for a in ["flash-next:4bit", "flash:4bit", "nace-ai/Qwen3.8-Flash-Next-MLX-4bit"]:
+        j = plan(a)
+        check(f"cli: {a} -> qwen3.8-flash-next:4bit at the app's pinned revision",
+              j.get("model") == "qwen3.8-flash-next:4bit" and j.get("kind") == "catalog" and
+              j.get("repo") == "nace-ai/Qwen3.8-Flash-Next-MLX-4bit" and
+              j.get("revision") == "5d423f9f563c1f1b7ca7945b268e65c0b92b0eae" and j.get("downloaded") is False, json.dumps(j))
     rc, _, err = run("serve", "--port", str(busy))
     check("cli: serve with no model, offline and nothing downloaded: a clear error", rc == 1 and "Can't reach" in err, err)
     rc, out, _ = run("--help")
@@ -313,13 +322,24 @@ msgs += [{"role": "assistant", "content": r["content"], "tool_calls": [
           "content": hosts_result(tc[0]["function"]["name"], tc[0]["function"]["arguments"]) if ok else hosts}]
 r2 = post({"messages": msgs, "tools": TOOLS, "max_tokens": 2048, "stream": True,
            "chat_template_kwargs": {"enable_thinking": False}}, stream=True)
-check("tool result: final answer mentions 3", "3" in r2["content"], repr(r2["content"])[:200])
+# (a model may check once more with another call, e.g. Qwen3.8-Flash-Next runs `wc -l` after reading the file: up to 2
+#  more rounds, as in the Responses loop below)
+rl, rounds = r2, 0
+while rounds < 2 and rl["finish"] == "tool_calls" and rl["tool_calls"] and "3" not in rl["content"]:
+    msgs += [{"role": "assistant", "content": rl["content"], "tool_calls": [
+                {"id": c["id"], "type": "function", "function": c["function"]} for c in rl["tool_calls"]]}] + \
+            [{"role": "tool", "tool_call_id": c["id"], "content": hosts_result(c["function"]["name"], c["function"]["arguments"])}
+             for c in rl["tool_calls"]]
+    rl = post({"messages": msgs, "tools": TOOLS, "max_tokens": 2048, "stream": True,
+               "chat_template_kwargs": {"enable_thinking": False}}, stream=True)
+    rounds += 1
+check("tool result: final answer mentions 3", "3" in rl["content"], repr(rl["content"])[:200])
 cached = r2["usage"]["prompt_tokens_details"]["cached_tokens"] if r2["usage"] else 0
 check("tool result: prefix reused (cached >= first prompt, less the generation prompt's tail)",
       cached >= first_prompt - GEN_TAIL, f"cached={cached} first_prompt={first_prompt} usage={r2['usage']}")
 
 # 3. next user turn: reuse from the checkpoint
-msgs += [{"role": "assistant", "content": r2["content"]},
+msgs += [{"role": "assistant", "content": rl["content"]},
          {"role": "user", "content": "Thanks. Now in one word: what OS uses /etc/hosts?"}]
 r3 = post({"messages": msgs, "tools": TOOLS, "max_tokens": 1024, "chat_template_kwargs": {"enable_thinking": False}})
 u = r3["usage"]

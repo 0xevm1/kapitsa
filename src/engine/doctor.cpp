@@ -356,8 +356,7 @@ int run_doctor(int argc, char** argv) {
         slots = auto_slots(dir, so, budget);
       }
       lp = plan_load(dir, dflash, false, ctx, slots, budget, chunk);
-      m = dory ? Dory::plan(dir, lp.prefill_chunk)
-          : nemotron ? NemotronH::plan(dir, lp.prefill_chunk) : Qwen35::plan(dir, lp.prefill_chunk);
+      m = model_plan(dir, lp.prefill_chunk);
     } catch (const std::exception& e) {
       if (tty) tty_rows.push_back(Row{.name = dir.substr(dir.find_last_of('/') + 1), .error = e.what()});
       else if (!as_json) printf("  %s: cannot read (%s)\n", dir.c_str(), e.what());

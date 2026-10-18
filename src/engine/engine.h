@@ -1,6 +1,6 @@
 // Chat engine: prompt rendering (Jinja chat template), prefix reuse across turns, generation,
-// and streaming output parsing (reasoning / content / tool calls) for Qwen3.5+ models (MLX safetensors) and
-// Nemotron-H models (NVIDIA's safetensors).
+// and streaming output parsing (reasoning / content / tool calls) for Qwen3.5+ models (MLX safetensors, Qwen3.8-Flash-Next
+// included) and Nemotron-H models (NVIDIA's safetensors).
 #pragma once
 #include "hub/hub.h"
 #include "model/dflash2.h"
@@ -8,6 +8,7 @@
 #include "model/lilicorr.h"
 #include "model/nemotron_h.h"
 #include "model/qwen35.h"
+#include "model/qwen4_exp.h"
 #include "tokenizer/tokenizer.h"
 #include "vision/encoder.h"
 
@@ -55,6 +56,10 @@ struct EngineOptions {
   int loops = 0;
   std::string loop_kv;
 };
+
+// The model's memory plan from its headers (config.json and the safetensors headers): Qwen3.5 family, Qwen3.8-Flash-Next,
+// Nemotron-H or Dory.
+MemPlan model_plan(const std::string& model_dir, int prefill_chunk);
 
 // Slots when none are asked for (EngineOptions::slots 0): kAutoSlots, so that an agent's conversation and its parallel
 // subagents or side requests each run on a warm slot of their own, or as many (down to 2, the old default) as the
@@ -364,7 +369,7 @@ class Engine {
 
   EngineOptions opts_;
   std::unique_ptr<Model> model_;
-  Qwen35* q35_ = nullptr;    // model_ when it is a Qwen3.5-family model (MTP, DFlash2, Neural Engine split)
+  Qwen35* q35_ = nullptr;    // model_ when it is a Qwen3.5-family model (MTP, DFlash2, Neural Engine split; Qwen4Exp too)
   NemotronH* nh_ = nullptr;  // model_ when it is a Nemotron-H model
   Dory* dory_ = nullptr;     // model_ when it is a Dory model
   std::unique_ptr<Checkpoint> ane_ck_;  // NI_ANE: recurrent state before a split chunk (rerun on failure)
