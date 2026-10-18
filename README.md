@@ -84,6 +84,8 @@ and the MLX engines, Q4_K_M on llama.cpp. Nemotron 3.5 Bolt runs NVIDIA's own 24
 | LM Studio (MLX engine) | 86 tok/s | 15 tok/s |
 | MTPLX | 80 tok/s | 36 tok/s |
 | oMLX + DFlash2 | 127 tok/s | 45 tok/s |
+| mlx-serve (MTP) | 124 tok/s | 38 tok/s |
+| mlx-serve (DFlash2) | 104 tok/s | 52 tok/s |
 | **Kapitsa** | **154 tok/s** | **63 tok/s** |
 
 | Engine | Nemotron 3.5 Bolt 74B-A9B · NVIDIA 24 GB |
@@ -93,8 +95,9 @@ and the MLX engines, Q4_K_M on llama.cpp. Nemotron 3.5 Bolt runs NVIDIA's own 24
 | oMLX + LiLiCorr | fails when sampling |
 | **Kapitsa** | **64 tok/s** |
 
-Bolt is NVIDIA's 24 GB checkpoint on every engine; oMLX's LiLiCorr drafter fails every sampled request. Qwen3.5 4B:
-being measured.
+Bolt is NVIDIA's 24 GB checkpoint on every engine; oMLX's LiLiCorr drafter fails every sampled request. mlx-serve ran a
+day later on a busier Mac, where Kapitsa wrote 139-167 tok/s on the 35B and 57-61 on the 27B in the same session
+([details](docs/benchmarks.md#mlx-serve-2026-10-18)). Qwen3.5 4B: being measured.
 <!-- Qwen3.5 4B slot: a column "Qwen3.5 4B" in the Qwen table above, "N tok/s" per engine. -->
 
 <details>
@@ -105,9 +108,9 @@ A follow-up is the time to the first token of an answer in a conversation that a
 | MacBook Pro (2024) · M4 Pro · 48 GB | Kapitsa | Next best on this Mac |
 | --- | ---: | --- |
 | Qwen3.6 35B-A3B, follow-up 4K / 16K | 0.06 / 0.09 s | MTPLX, 0.10 / 0.15 s |
-| Qwen3.6 35B-A3B, peak memory | 21.1 GB | oMLX + DFlash2, 23.4 GB |
+| Qwen3.6 35B-A3B, peak memory | 21.1 GB | mlx-serve + MTP, 22.5 GB |
 | Qwen3.8 27B, follow-up 4K / 16K | 0.28 / 0.27 s | MTPLX, 0.33 / 0.39 s |
-| Qwen3.8 27B, peak memory | 19.4 GB | oMLX without speculation, 20.5 GB |
+| Qwen3.8 27B, peak memory | 19.4 GB | mlx-serve + MTP, 20.1 GB |
 | Nemotron 3.5 Bolt, follow-up 4K / 16K | 0.28 / 0.32 s | oMLX, 0.72 / 0.72 s |
 | Nemotron 3.5 Bolt, peak memory | 22.7 GB | oMLX, 30.3 GB |
 
