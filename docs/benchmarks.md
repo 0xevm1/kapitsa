@@ -2,7 +2,8 @@
 
 How fast Kapitsa runs Qwen3.6-35B-A3B and Qwen3.8-27B on a MacBook Pro (Nemotron 3.5 Bolt has
 [its own section](#nemotron-35-bolt-74b-a9b-2026-10-18)), compared with the engines people run these models with on a
-Mac: llama.cpp, Ollama, LM Studio, mlx-lm, oMLX and MTPLX. Each engine ran at its latest release
+Mac: llama.cpp, Ollama, LM Studio, mlx-lm, oMLX and MTPLX (and mlx-serve, a day later:
+[its own section](#mlx-serve-2026-10-18)). Each engine ran at its latest release
 with its own best settings, on the same 4-bit weights wherever it accepts them, through the same requests and the
 same checks. The harness and its configs are in [bench/harness](../bench/harness/README.md), and every result file
 behind these tables is in [bench/results/2026-10-17](../bench/results/2026-10-17/).
@@ -269,6 +270,86 @@ desktop's own GPU work (the app the session ran in: 10-40% of the GPU) was there
 
 Kapitsa's earlier run in the same session (before the weight packing that lowered its memory; `confirmations/`) gave
 64.7 / 65.6 tok/s decode, 455 / 396 tok/s prefill, 0.25 / 0.33 s follow-ups and 24.9 GB.
+
+## mlx-serve (2026-10-18)
+
+[mlx-serve](https://github.com/ddalcu/mlx-serve) 26.10.2 (its latest release, MLX 0.32.3), a Zig server over MLX with
+its own Metal kernels, in both of its speculative setups for these models, MTP and DFlash2, against Kapitsa (main at
+c93f27c). One session on 2026-10-18, 12:40-13:38, under one hold of the GPU lock: Kapitsa first and last, mlx-serve in
+between, with [configs/mlx-serve.json](../bench/harness/configs/mlx-serve.json). Result files:
+[bench/results/2026-10-18-mlx-serve](../bench/results/2026-10-18-mlx-serve/).
+
+Kapitsa was faster than mlx-serve on every metric on both models and used less memory; mlx-serve led in no column. The
+closest is writing on the 27B: mlx-serve's DFlash2 draft tree wrote 51.9 tok/s sampled and 55.1 greedy, against
+Kapitsa's 58.4 and 61.3 (56.8-61.5 and 60.8-62.5 over its four runs in the session). That is the fastest any engine
+but Kapitsa has written this model on this Mac (next: oMLX + DFlash2, 45.3 and 45.7 on 2026-10-17). mlx-serve's tree
+gets about as many tokens out of a round as Kapitsa's verify (4.9-5.4 against 4.6-5.3), but its rounds take longer
+(about 97 ms against 81-84 ms; among other things it runs the drafter at 8 bits, Kapitsa at 4). On the 35B mlx-serve's
+faster setup is MTP, 123.9 / 130.0 tok/s against Kapitsa's 166.8 / 173.1 (138.7 / 161.8 in its run before mlx-serve);
+with DFlash2 it switched DFlash off early in every answer. Kapitsa read long prompts 1.14-1.16× faster than
+mlx-serve's MTP setup on the 35B and 1.9-2.7× faster on the 27B, and answered follow-ups on the 35B in 0.05-0.07 s
+against 0.26-0.38 s (mlx-serve's cache left 63-95 tokens of each follow-up to read there, Kapitsa's 20-27).
+
+**Qwen3.6-35B-A3B**
+
+| Engine (setting) | Decode, T = 0.6 (tok/s) | Decode, greedy (tok/s) | Prefill 4K (tok/s) | Prefill 16K (tok/s) | Cached follow-up 4K (s) | Cached follow-up 16K (s) | Peak memory (GB) | Tool calls |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| **Kapitsa** (DFlash2 drafter)<sup>1</sup> | **166.8** (138.2–173.8) | **173.1** (167.1–176.6) | **1,145** | **961** | **0.05** | **0.06** | **20.9** | pass |
+| mlx-serve + MTP (depth up to 2) | 123.9 (118.3–130.3) | 130.0 (117.6–135.7) | 986 | 838 | 0.26 | 0.38 | 22.5 | pass |
+| mlx-serve + DFlash2 (block 4) | 104.2 (104.1–104.3)<sup>2</sup> | 107.0 (107.0–107.1)<sup>2</sup> | 911 | 783 | 0.26 | 0.38 | 22.9 | pass |
+
+**Qwen3.8-27B**
+
+| Engine (setting) | Decode, T = 0.6 (tok/s) | Decode, greedy (tok/s) | Prefill 4K (tok/s) | Prefill 16K (tok/s) | Cached follow-up 4K (s) | Cached follow-up 16K (s) | Peak memory (GB) | Tool calls |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| **Kapitsa** (DFlash2 drafter)<sup>1</sup> | **58.4** (55.3–65.1)<sup>3</sup> | **61.3** (58.5–61.6) | **264**<sup>3</sup> | **323**<sup>3</sup> | **0.23** | **0.26** | **19.4** | pass<sup>3</sup> |
+| mlx-serve + DFlash2 (draft tree, block 8) | 51.9 (50.0–54.3) | 55.1 (54.5–56.4) | 126 | 120<sup>3</sup> | 0.27 | 0.40 | 21.5 | pass |
+| mlx-serve + MTP (depth up to 4) | 38.0 (34.1–42.3) | 38.9 (37.7–39.6) | 126 | 120<sup>3</sup> | 0.29 | 0.40 | 20.1 | pass |
+
+1. Kapitsa ran before and after mlx-serve; the table shows its newest run. On the 35B that is the run after; the run
+   before gave 138.7 (134.9–155.7) / 161.8 (142.0–173.7) tok/s decode, 1,123 / 953 tok/s prefill, 0.05 / 0.07 s
+   follow-ups and 20.9 GB. On the 27B it is the second of two re-runs at the end of the session; its four 27B runs
+   gave 56.8–61.5 / 60.8–62.5 tok/s decode, 242–296 / 231–323 tok/s prefill, 0.23–0.25 / 0.26 s follow-ups and
+   19.4 GB.
+2. DFlash ran for the first 8 to 33 rounds of each timed answer, then switched itself off for the rest of it: the
+   drafts it accepted per round (1.73–1.78) stayed under mlx-serve's bar for MoE models (1.80). The rest of each
+   answer was plain decoding, hence the narrow range.
+3. Flagged for contention: Chrome and Slack used more than 5% of the GPU for sustained stretches (up to 90% at peaks)
+   in every 27B run of the session, most of all in the long prefills (mlx-serve's 16K prefill takes over two minutes).
+   Each flagged 27B setting was re-run (Kapitsa twice; a second re-run of mlx-serve's MTP was stopped in its warm-up
+   to keep the session short), every re-run was flagged again, and the table shows the newest run with its flagged
+   phases marked. The earlier mlx-serve runs: MTP 36.3 / 38.8 tok/s decode, 127 / 120 tok/s prefill, 0.36 / 0.44 s
+   follow-ups, 20.2 GB; DFlash2 52.8 / 55.0, 126 / 117, 0.32 / 0.42 s, 21.5 GB. Ambient load (the camera daemon and
+   the app that drove the runs, never flagged) took 10–18% of the GPU in the 27B runs until the last one (3.7%), in
+   which Kapitsa's 16K prefill reached 323 tok/s; on a quiet Mac on 2026-10-17 Kapitsa read the 27B's prompts at 389 /
+   335 tok/s.
+
+**Weights.** On the 35B mlx-serve read the vendor's own pack,
+[ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit](https://huggingface.co/ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit) @6122e2b: its
+trunk shards are the ones every engine here reads (sha256-identical), plus its MTP sidecar (mlx-community's 4-bit
+head, 0.44 GB). The vendor's 27B pack
+([ddalcu/Qwen3.8-27B-MLX-Serve-4bit](https://huggingface.co/ddalcu/Qwen3.8-27B-MLX-Serve-4bit) @901aa73) is its own
+conversion of the model (bf16 embedding; in the tensors sampled about 0.2% of the 4-bit codes differ from
+lmstudio-community's), so on the 27B mlx-serve read the trunk every engine reads with that pack's MTP head (its 29
+`mtp.*` tensors byte for byte, 0.29 GB) and its `drafter/`, the same file as the DFlash2 drafter Kapitsa reads. For
+DFlash2 on the 35B it read incoai's drafter, also Kapitsa's. `bench/harness/tools/mlx_serve_pack.py` builds both
+folders from the shared weights (APFS clones) and the vendor's files that differ.
+
+**Settings.** mlx-serve's own defaults, except where short runs just before the session measured faster (five sampled
+decodes each; [tuning](../bench/results/2026-10-18-mlx-serve/README.md#tuning)):
+
+- MTP: the model's head with exact verification (the default; the opt-in lossy `--mtp-typical`/`--mtp-tokenv3`
+  verifiers change the output distribution). `--mtp-max-depth 2` on the 35B (127.5 tok/s in the short runs, the
+  adaptive default 124.8) and 4 on the 27B (37.8 against 36.3).
+- DFlash2: the drafter, which mlx-serve quantizes to 8 bits at load on M1-M4, without the MTP head (`--no-mtp`): with
+  both loaded, mlx-serve hands a request to MTP when the previous one is still finishing on the server, and the
+  benchmark's back-to-back requests sometimes are (2 of 5 timed answers on the 27B, at half the speed). On the 27B a
+  tree of up to 7 drafts a round, block 8 (the defaults; block 6 and linear drafts were slower). On the 35B block 4
+  (103.9 tok/s, the default block 5 102.4, block 8 88.2) and no tree: mlx-serve verifies trees only on dense models,
+  and on a MoE model it switches DFlash off for the rest of an answer once fewer than 1.8 drafts a round are accepted.
+  mlx-serve ships no drafter for the 35B and documents DFlash for dense models, but its loader binds this one.
+- PLD (prompt lookup) stays on, its default; mlx-serve runs one speculative mode per request (DFlash, else MTP, else
+  PLD), so it never ran. A fresh `HOME` per run, 32K context, one sequence.
 
 ## Run benchmarks locally
 
