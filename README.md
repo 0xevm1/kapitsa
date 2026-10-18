@@ -12,8 +12,6 @@
 brew install nace-ai/tap/kapitsa
 ```
 
-Homebrew and the prebuilt binary work from the first release on. Until then, build from source.
-
 <details>
 <summary>Without Homebrew, or from source</summary>
 
