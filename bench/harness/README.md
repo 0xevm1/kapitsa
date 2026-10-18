@@ -26,6 +26,16 @@ for the 35B and 27B models.
 
 To tabulate the published runs: `python3 compare_table.py ../results/2026-10-17 --out /tmp/table`.
 
+For Kapitsa alone, `kapitsa bench` runs this protocol from the binary itself (src/bench/protocol.cpp ports `bench.py`
+request for request, and the server start, warm-up, quiet wait and contention monitor of `compare_engines.py` and
+`gpu_hogs.py`; it takes the same GPU lock). Its results compare with this harness's and go to the
+[community results](../community/RESULTS.md). `tests/test_bench.py` runs both clients against one scripted server and
+checks that they send the same requests. Two differences: it reads memory with `proc_pid_rusage` (the same
+`phys_footprint_peak` that `footprint` prints) and does not sample `footprint` and `ps` every 2 s while it measures;
+and its client is C++, whose own share of a time to first token is about 1-1.5 ms smaller than `bench.py`'s (measured
+against a server that answers at once): nothing next to a cold prompt's seconds, but 2-3% of a 50-60 ms follow-up, so
+its follow-ups read slightly faster than the harness's for the same server.
+
 ## What a run measures
 
 `compare_engines.py` starts the engine's server, waits until it answers, warms it up, waits for a quiet GPU and runs
