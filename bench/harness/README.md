@@ -196,6 +196,40 @@ ones the weights' `mtplx_runtime.json` recommends: profile `sustained`, depth 1 
 own release), and `turbo`, depth 3 for the 27B (the runtime file of MTPLX's 27B release). Inline session post-commit,
 so follow-up turns hit its session cache.
 
+### mlx-serve (`configs/mlx-serve.json`) [26.10.2, mlx 0.32.3]
+
+The release binary (`mlx-serve-bin-macos-arm64.tar.gz` from github.com/ddalcu/mlx-serve/releases, unpacked; or
+`brew install mlx-serve`); set `MLX_SERVE_BIN` unless `mlx-serve` is on PATH. Its model folders are built from the
+weights above (APFS clones) plus the vendor's files that differ, which the script downloads (and checks):
+
+```bash
+python3 tools/mlx_serve_pack.py qwen3.6-35b-a3b   # into <models>/mlx-serve/: --models DIR, else $BENCH_MODELS, else ~/models
+python3 tools/mlx_serve_pack.py qwen3.8-27b
+```
+
+On the 35B that is the vendor's pack itself: the same trunk shards (sha256-identical) with its MTP sidecar
+`mtp/weights.safetensors`. On the 27B the vendor's pack is its own conversion (bf16 embedding, some tensors
+quantized differently, 18.2 GB), so the folder holds the trunk every engine reads plus the vendor's MTP head (its 29
+`mtp.*` tensors, byte for byte, as a sidecar) and the vendor's `drafter/` (the same file as the DFlash2 drafter above).
+
+Two setups per model, at mlx-serve's own defaults except where short runs just before the session measured faster (five
+sampled decodes each; the [tuning table](../results/2026-10-18-mlx-serve/README.md#tuning)):
+
+- **MTP:** the model's MTP head with exact verification (the default; the opt-in lossy `--mtp-typical` and
+  `--mtp-tokenv3` verifiers change the output distribution) and `--no-drafter`. `--mtp-max-depth 2` on the 35B and
+  4 on the 27B: a few percent faster than the adaptive default (cap 6 on an M4 Pro).
+- **DFlash2:** the drafter named with `--drafter` (mlx-serve quantizes it to 8 bits at load on M1-M4) and
+  `--no-mtp`: with the head loaded, a request that arrives while the previous one is still finishing on the server, as
+  the benchmark's back-to-back requests do, is handed to MTP. On the 27B, a tree of up to 7 drafts a round (block 8,
+  the defaults). On the 35B, `--draft-block-size 4` and no tree: mlx-serve binds DFlash drafters to MoE trunks, but its
+  break-even bar for MoE verifies (1.8 drafts accepted per round) switched DFlash off early in every timed answer.
+- PLD (prompt lookup) stays on, its default; mlx-serve runs one speculative mode per request (DFlash, else MTP, else
+  PLD), so it never runs in these setups.
+
+A fresh `HOME` per run (in `{state}`): no saved settings apply, and the speculation cost table mlx-serve learns while it
+runs (`~/.mlx-serve/round-cost/`) starts empty; the warm-up's three full decodes train it. 32K context, one sequence
+(its default `--max-concurrent 1`).
+
 ## Configs
 
 `configs/*.json` are lists of configs; `compare_engines.py` merges the files you pass, in order. Keep labels stable:
@@ -260,5 +294,6 @@ the sampling flags change the run (`--help`). Wrap your own server's whole lifet
 | `configs/` | One file per engine, both models |
 | `corpus/` | The frozen prompt corpus and its notice (Apache-2.0 excerpts of Hugging Face Transformers) |
 | `launchers/lmstudio_serve.sh` | LM Studio's daemon as a foreground benchmark server |
+| `tools/mlx_serve_pack.py` | mlx-serve's model folders from the shared weights (clones) and the vendor files that differ |
 | `tools/ollama_mlx_import.py`, `tools/ollama_mlx_verify.py` | Zero-copy import of MLX weights for Ollama's MLX runner, and its check |
 | `local.env.example` | Paths for this Mac, copied to `local.env` |
