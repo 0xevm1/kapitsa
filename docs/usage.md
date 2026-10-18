@@ -46,9 +46,10 @@ Those start the best model for this Mac, with the same output as before.
 | `qwen3.8-27b` | `27b` | Qwen3.8, dense: the strongest coder of the three Qwen models, slower to write | 20.2 GB | `4bit` (default), `5bit`, `6bit`, `8bit`, `bf16` |
 | `qwen3.5-4b` | `4b` | Qwen3.5, dense and small: for 16-24 GB Macs and simple tasks | 3.3 GB | `4bit` (default), `6bit`, `8bit`, `bf16` |
 | `nemotron-3.5-bolt` | `bolt`, `nemotron-bolt` | NVIDIA Nemotron 3.5 Bolt 74B-A9B: hybrid Mamba-2 mixture of experts, 9B active, 2-bit experts; an agentic model | 25.1 GB | `24gb` |
+| `nemotron-3.5-super-vl` | `super-vl`, `super`, `nemotron-super` | NVIDIA Nemotron 3.5 Super-VL 120B-A12B: hybrid Mamba-2 mixture of experts, 12B active, 4-bit (NVFP4) experts; text only for now; needs a 96 GB+ Mac | 76.4 GB | `nvfp4` |
 
 A download includes the companion files that speed decoding up: an MTP head and a DFlash2 draft model for the 35B and
-27B, an MTP head for the 4B, NVIDIA's LiLiCorr draft model for Bolt.
+27B, an MTP head for the 4B, NVIDIA's LiLiCorr draft model for Bolt and for Super-VL.
 
 `--model` takes a name or alias (`35b`), one with a variant (`35b:6bit`), a Hugging Face repo (`org/name[@revision]`,
 see [Other models](#other-models)), a folder (a path starting with `/`, `~`, `./` or `../`), a `.gguf` file
@@ -80,6 +81,8 @@ variants fit this Mac. Every variant keeps the model's MTP head and draft model,
 download is always the same bytes. After a Kapitsa update that pins newer revisions, the next start fetches only the
 files that changed (offline, it keeps using the copy it has). Bolt has one variant, `24gb`: NVIDIA's own
 mixed-precision checkpoint (IQ2_XXS experts, NVFP4 Mamba layers, Q8_0 attention, latent and head, BF16 embedding).
+Super-VL has one variant, `nvfp4`: NVIDIA's own checkpoint as stored (NVFP4 routed and shared experts, FP8 Mamba
+projections, attention and head, BF16 latent projections, which load as 8-bit, router and embedding).
 
 ### Other models
 
@@ -93,7 +96,8 @@ A folder needs `config.json`, the `*.safetensors` weights and `tokenizer.json`, 
 `mtp.safetensors`. The official Hugging Face checkpoints of the dense models run as well.
 
 Refused, with a message: other architectures, other quantizations (MLX's `mxfp4`, `nvfp4` and `mxfp8` modes among
-them), mixture-of-experts checkpoints in the Hugging Face layout, and weights larger than this Mac's memory budget.
+them; NVIDIA's own NVFP4 checkpoints of the catalog's Nemotron models are read as they are), mixture-of-experts
+checkpoints in the Hugging Face layout, and weights larger than this Mac's memory budget.
 
 ### GGUF files
 
@@ -262,6 +266,8 @@ tools and MCP servers work as usual:
 `qwen3.6-35b-a3b`, `qwen3.8-27b` and `nemotron-3.5-bolt` read images. Their vision towers come with the download and
 load with the first image: about 0.9 GB of GPU memory for the Qwen models, 1.7 GB for Bolt. On a model without one,
 such as the 4B, each image becomes a short note in the prompt, so agents that attach screenshots keep working.
+`nemotron-3.5-super-vl` is text only for now: its vision tower (Bolt's, with one more LayerNorm) is not run yet, so its
+images become that note too.
 
 | API | Image part |
 | --- | --- |
@@ -284,7 +290,7 @@ Kapitsa holds at most a budget of GPU memory: Metal's recommended working set, w
 (at least 512 MB) for the Neural Engine service and other GPU users; `--mem-budget GB` (or `NI_MEM_BUDGET`) sets it.
 Fixed at start are the weights, the MTP head, the prefill buffers (they scale with `--prefill-chunk`), each slot's
 recurrent state and, where used, the Neural Engine split's buffers and the draft model. Each conversation's KV cache
-grows as it fills: 36 KB per token on the 4B, 68 KB on the 27B, 22 KB on the 35B, 8 KB on Bolt. When memory is short:
+grows as it fills: 36 KB per token on the 4B, 68 KB on the 27B, 22 KB on the 35B, 8 KB on Bolt and on Super-VL. When memory is short:
 
 - At start, the fixed part and an 8K-token KV cache must fit, else the server exits with `insufficient memory: ...`,
   what each part needs and what would help (fewer `--slots`, `--prefill-chunk 1024`, no draft model, a smaller model,
@@ -318,6 +324,11 @@ the working set at about 2/3 to 78% of the RAM, depending on its version, hence 
 
 On a 48 GB Mac the 35B also fits in 6-bit with a full conversation and its draft model, in 8-bit only with shorter ones.
 For Bolt and the other variants, run `kapitsa doctor`.
+
+Super-VL's weights alone are 70.1 GB, so it needs a 96 GB+ Mac: on 128 GB (a 110.8 GB budget) it runs with its draft
+model (3.5 GB at two slots) and room for millions of tokens of KV cache; on 96 GB it starts without the draft model
+(about 29K tokens of KV cache in all at a 72 GB budget) or with it from an 80 GB budget; on 48 and 64 GB Macs it is
+refused before the download (`... does not fit this Mac: its weights alone (70.1 GB, ...) exceed ...`).
 
 ## Benchmarking this Mac
 
@@ -391,6 +402,8 @@ this Mac, on `127.0.0.1:8000`) in the background and at each login, restarting i
 | `NI_IMAGE_MAX_MB` | `32` | The largest image taken, in MB. |
 | `NI_IMAGE_TIMEOUT_S` | `30` | The time limit for downloading an `http(s)` image, in seconds. |
 | `NI_IMAGE_CACHE_MB` | `256` | GPU memory kept for the embeddings of recent images. |
+| `NI_NH_BF16` | off | Nemotron Super-VL: `1` keeps its BF16 latent projections in BF16 instead of 8-bit (exact; about 4% slower decoding). |
+| `NI_LILI_DYN` | `0.04` | Nemotron's LiLiCorr draft model: how many of its 7 drafts are verified is chosen per cycle, weighing their expected acceptance against each extra row's cost (this value, relative to a cycle's fixed cost); `0` verifies all 7. |
 | `NI_PREWARM` | on | `0` creates the GPU pipelines on first use instead of at load. |
 
 The other `NI_*` switches exist for development and A/B tests.
