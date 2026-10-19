@@ -1,0 +1,43 @@
+{
+ "source": "MATH-500 (HuggingFaceH4/MATH-500 @ 6e4ed1a2, test.jsonl): the first level-5 problems without [asy] figures, round-robin over subjects; problems and reference solutions from the MATH dataset (Hendrycks et al. 2021, MIT license). The 1024-token sequence holds the first two and the start of the third; the fourth keeps the third rendered as an earlier turn.",
+ "problems": [
+  "test/intermediate_algebra/1994.json",
+  "test/number_theory/737.json",
+  "test/counting_and_probability/525.json",
+  "test/precalculus/675.json"
+ ],
+ "messages": [
+  {
+   "role": "user",
+   "content": "Define\n\\[p = \\sum_{k = 1}^\\infty \\frac{1}{k^2} \\quad \\text{and} \\quad q = \\sum_{k = 1}^\\infty \\frac{1}{k^3}.\\]Find a way to write\n\\[\\sum_{j = 1}^\\infty \\sum_{k = 1}^\\infty \\frac{1}{(j + k)^3}\\]in terms of $p$ and $q.$\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+  },
+  {
+   "role": "assistant",
+   "content": "We count the number of times $\\frac{1}{n^3}$ appears in the sum\n\\[\\sum_{j = 1}^\\infty \\sum_{k = 1}^\\infty \\frac{1}{(j + k)^3},\\]where $n$ is a fixed positive integer.  (In other words, we are conditioning the sum on $j + k$.)  We get a term of $\\frac{1}{n^3}$ each time $j + k = n.$  The pairs $(j,k)$ that work are $(1,n - 1),$ $(2,n - 2),$ $\\dots,$ $(n - 1,1),$ for a total of $n - 1$ pairs.  Therefore,\n\\begin{align*}\n\\sum_{j = 1}^\\infty \\sum_{k = 1}^\\infty \\frac{1}{(j + k)^3} &= \\sum_{n = 1}^\\infty \\frac{n - 1}{n^3} \\\\\n&= \\sum_{n = 1}^\\infty \\left( \\frac{n}{n^3} - \\frac{1}{n^3} \\right) \\\\\n&= \\sum_{n = 1}^\\infty \\left( \\frac{1}{n^2} - \\frac{1}{n^3} \\right) \\\\\n&= \\sum_{n = 1}^\\infty \\frac{1}{n^2} - \\sum_{n = 1}^\\infty \\frac{1}{n^3} \\\\\n&= \\boxed{p - q}.\n\\end{align*}"
+  },
+  {
+   "role": "user",
+   "content": "The proper divisors of 12 are 1, 2, 3, 4 and 6. A proper divisor of an integer $N$ is a positive divisor of $N$ that is less than $N$. What is the sum of the proper divisors of the sum of the proper divisors of 284?\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+  },
+  {
+   "role": "assistant",
+   "content": "Prime factorize $284=2^2\\cdot71$. The sum of the proper divisors of $284$ is\n\\begin{align*}\n1+2+2^2+71+2 \\cdot 71 &= (1+2+2^2)(1+71)-284 \\\\\n&= 220 \\\\\n&= 2^2\\cdot5\\cdot11.\n\\end{align*}Here we have used the observation that multiplying out $(1+2+2^2)(1+71)$ by distributing yields an expression which is the sum of all $6$ factors of $284.$ Applying this observation again, we find that the sum of the proper divisors of $220$ is $$(1+2+2^2)(1+5)(1+11)-220=7\\cdot 6\\cdot 12-220=\\boxed{284}.$$"
+  },
+  {
+   "role": "user",
+   "content": "In how many ways can $7$ people sit around a round table if no two of the $3$ people Pierre, Rosa, and Thomas can sit next to each other? (Seating arrangements which are rotations of each other are treated as the same.)\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+  },
+  {
+   "role": "assistant",
+   "content": "After Pierre sits, we can place Rosa either two seats from Pierre (that is, with one seat between them) or three seats from Pierre. We tackle these two cases separately:\n\nCase 1: Rosa is two seats from Pierre. There are $2$ such seats. For either of these, there are then four empty seats in a row, and one empty seat between Rosa and Pierre. Thomas can sit in either of the middle two of the four empty seats in a row. So, there are $2\\cdot 2 = 4$ ways to seat Rosa and Thomas in this case. There are then $4$ seats left, which the others can take in $4! = 24$ ways. So, there are $4\\cdot 24 = 96$ seatings in this case.\n\nCase 2: Rosa is three seats from Pierre (that is, there are $2$ seats between them). There are $2$ such seats. Thomas can't sit in either of the $2$ seats directly between them, but after Rosa sits, there are $3$ empty seats in a row still, and Thomas can only sit in the middle seat of these three. Once again, there are $4$ empty seats remaining, and the $4$ remaining people can sit in them in $4! = 24$ ways. So, we have $2\\cdot 24 = 48$ seatings in this case.\n\nPutting our two cases together gives a total of $96+48 = \\boxed{144}$ seatings."
+  },
+  {
+   "role": "user",
+   "content": "Find the smallest positive real number $C$ for which\n\\[\\left\\| \\begin{pmatrix} 2 & 3 \\\\ 0 & -2 \\end{pmatrix} \\bold{v} \\right\\| \\le C \\|\\bold{v}\\|\\]for all two-dimensional vectors $\\bold{v}.$\n\nNote that for a two-dimensional vector $\\mathbf{a},$ $\\|\\mathbf{a}\\|$ is the magnitude of $\\mathbf{a}.$\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+  },
+  {
+   "role": "assistant",
+   "content": "Let $\\bold{v} = \\begin{pmatrix} x \\\\ y \\end{pmatrix}$.  Then\n\\[\\|\\bold{v}\\| = \\left\\| \\begin{pmatrix} x \\\\ y \\end{pmatrix} \\right\\| = \\sqrt{x^2 + y^2},\\]and\n\\begin{align*}\n\\left\\| \\begin{pmatrix} 2 & 3 \\\\ 0 & -2 \\end{pmatrix} \\bold{v} \\right\\| &= \\left\\| \\begin{pmatrix} 2 & 3 \\\\ 0 & -2 \\end{pmatrix} \\begin{pmatrix} x \\\\ y \\end{pmatrix} \\right\\| \\\\\n&= \\left\\| \\begin{pmatrix} 2x + 3y \\\\ -2y \\end{pmatrix} \\right\\| \\\\\n&= \\sqrt{(2x + 3y)^2 + (-2y)^2} \\\\\n&= \\sqrt{4x^2 + 12xy + 13y^2},\n\\end{align*}so the given inequality becomes\n\\[\\sqrt{4x^2 + 12xy + 13y^2} \\le C \\sqrt{x^2 + y^2},\\]or\n\\[\\sqrt{\\frac{4x^2 + 12xy + 13y^2}{x^2 + y^2}} \\le C.\\]Thus, we can think of $C$ as the maximum value of the expression in the left-hand side.\n\nMaximizing the expression in the left-hand side is equivalent to maximizing its square, namely\n\\[\\frac{4x^2 + 12xy + 13y^2}{x^2 + y^2}.\\]Let $k$ be a possible value of this expression, which means the equation\n\\[\\frac{4x^2 + 12xy + 13y^2}{x^2 + y^2} = k\\]has a solution in $x$ and $y$.  We can re-write this equation as\n\\[(4 - k) x^2 + 12xy + (13 - k) y^2 = 0.\\]For this quadratic expression to have a solution in $x$ and $y$, its discriminant must be nonnegative.  In other words,\n\\[12^2 - 4 (4 - k)(13 - k) \\ge 0,\\]or $4k^2 - 68k + 64 \\le 0$.  This inequality factors as $4(k - 1)(k - 16) \\le 0$.  The largest value of $k$ that satisfies this inequality is 16, so the value of $C$ we seek is $\\sqrt{16} = \\boxed{4}$.  Note that equality occurs for\n\\[\\bold{v} = \\begin{pmatrix} 1 \\\\ 2 \\end{pmatrix}.\\]"
+  }
+ ]
+}
