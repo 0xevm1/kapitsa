@@ -101,6 +101,26 @@ def post(body, stream=False):
             out["usage"] = c.get("usage")
     return out
 
+def chat_stream(body, out=None):
+    """(status, [(t, data), ...]) of a streamed chat completion: when each data line came (s) and its JSON ("[DONE]"),
+    appended to `out` as they come; an HTTP error is (status, its JSON body)"""
+    req = urllib.request.Request(BASE + "/v1/chat/completions", data=json.dumps(dict(body, stream=True)).encode(),
+                                 headers={"Content-Type": "application/json", **auth()})
+    t0, out = time.time(), [] if out is None else out
+    try:
+        r = urllib.request.urlopen(req, timeout=900)
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"{}")
+    for line in r:
+        line = line.decode().strip()
+        if line.startswith("data: "):
+            out.append((time.time() - t0, "[DONE]" if line == "data: [DONE]" else json.loads(line[6:])))
+    return r.status, out
+
+def choice(d):
+    """a chunk's first choice ({} for an error event or [DONE])"""
+    return (d.get("choices") or [{}])[0] if isinstance(d, dict) else {}
+
 fails = 0
 def check(name, ok, detail=""):
     global fails
@@ -734,6 +754,48 @@ after = post(counting("c6", 8), stream=True)
 check("a client gone mid-stream: the request beside it is answered, the next one starts at once",
       beside["usage"]["completion_tokens"] == 100 and after["usage"]["completion_tokens"] == 8 and time.time() - t0 < 10,
       f"beside {beside['usage']}, next request {time.time() - t0:.1f} s")
+
+# 10e. a Chat Completions stream: a prompt over the context is a plain 400 context_length_exceeded (opencode and other
+#      clients compact on it), as without "stream"; the stream starts before the request has a slot, and while it waits
+#      (or a long prefill runs) it gets a chunk with an empty delta every 15 s (clients drop a stream idle for minutes)
+ROLE = {"role": "assistant", "content": ""}
+def is_keepalive(d):
+    return choice(d).get("delta") == {} and choice(d).get("finish_reason") is None
+for streamed in (False, True):
+    if streamed:
+        st, e = chat_stream({"messages": [{"role": "user", "content": long_text}], "max_tokens": 10})
+    else:
+        st, e = call("/v1/chat/completions", {"messages": [{"role": "user", "content": long_text}], "max_tokens": 10})
+    check(f"chat{' stream' if streamed else ''}: a prompt over the context is a 400 context_length_exceeded",
+          st == 400 and isinstance(e, dict) and e.get("error", {}).get("code") == "context_length_exceeded" and
+          "maximum context length" in e["error"]["message"], str(e)[:300])
+def hold(tag):
+    """a stream that writes until its client goes, open once its first token is out (it has a slot)"""
+    body = {"messages": [{"role": "user", "content": f"[{tag}] Count from 1 to 100000, one number per line, nothing else."}],
+            "max_tokens": 20000, "temperature": 0, "top_k": 1, "stream": True, "chat_template_kwargs": {"enable_thinking": False}}
+    r = urllib.request.urlopen(urllib.request.Request(BASE + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                                      headers={"Content-Type": "application/json", **auth()}), timeout=600)
+    for line in r:
+        if line.startswith(b"data: {") and choice(json.loads(line[6:])).get("delta", {}).get("content"):
+            break
+    return r
+holders = [hold(f"hold {i} {time.time()}") for i in range(SLOTS)]
+ev = []
+waiting = threading.Thread(target=chat_stream, args=(counting(f"wait {time.time()}", 8), ev))
+waiting.start()
+t0 = time.time()
+while time.time() - t0 < 45 and sum(is_keepalive(d) for _, d in list(ev)) < 2:
+    time.sleep(0.2)
+for h in holders:  # their clients go: they stop at their next token, and the waiting request gets a slot
+    h.close()
+waiting.join()
+keep = [t for t, d in ev if is_keepalive(d)]
+first = next((t for t, d in ev if choice(d).get("delta", {}).get("content")), None)
+check("chat stream: while every slot is busy the stream starts at once, gets an empty chunk every 15 s, and its first "
+      "token comes once a slot frees",
+      len(ev) > 2 and choice(ev[0][1]).get("delta") == ROLE and ev[0][0] < 1.0 and len(keep) == 2 and
+      15 <= keep[0] < 17.5 and 14 <= keep[1] - keep[0] < 17.5 and first is not None and first > keep[1] and
+      ev[-1][1] == "[DONE]", f"first chunk {ev[0] if ev else None}, keepalives at {keep}, first token at {first}")
 
 print("FAILED: %d" % fails if fails else "ALL PASSED")
 sys.exit(1 if fails else 0)
