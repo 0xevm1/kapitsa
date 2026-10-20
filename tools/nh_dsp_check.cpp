@@ -198,9 +198,15 @@ void check_mask_rows() {
   report("nh_dsp_mask_rows", err, 0);
 }
 
-void check_walk() {
+std::string walk_name(const char* what, int V, int R, int K) {
+  char b[96];
+  snprintf(b, sizeof b, "%s V%d R%d K%d", what, V, R, K);
+  return b;
+}
+
+void check_walk(const int V, const int R, const int K) {
   // V tokens, rank R (NVFP4 W2 in the loader's layout), S slots of K candidates
-  const int V = 77, R = 48, S = 7, K = 5, P = 3;
+  const int S = 7, P = 3;
   std::vector<uint16_t> w1(size_t(V) * R);
   std::vector<float> w1f(w1.size());
   for (size_t i = 0; i < w1.size(); ++i) {
@@ -277,8 +283,38 @@ void check_walk() {
     bad += bt.as<int>()[P + 1 + s] != ref_tok[size_t(s)];
     for (int c = 0; c < K; ++c) err = std::max(err, std::fabs(ref_q[size_t(s) * K + c] - bql.as<float>()[s * K + c]));
   }
-  report("nh_dsp_walk tokens", double(bad), 0);
-  report("nh_dsp_walk log-probs", err, 1e-4);
+  report(walk_name("nh_dsp_walk tokens", V, R, K).c_str(), double(bad), 0);
+  // the two-pass walk (nh_dsp_walk_dots + nh_dsp_walk_pick): bitwise the one-pass kernel's tokens, picks, log-probs
+  {
+    Buffer bt2 = up(tok, "tok2"), bp2 = g.alloc(64, "picks2"), bq2 = g.alloc(size_t(S) * K * 4, "qlp2"),
+           bd = g.alloc(size_t(S) * K * K * 4, "dots");
+    auto e2 = g.begin();
+    e2->use(NemotronH::pipeline("nh_dsp_walk_dots"));
+    e2->buf(0, bc);
+    e2->buf(1, b1);
+    e2->buf(2, bq);
+    e2->buf(3, bsc);
+    e2->buf(4, bt2);
+    e2->buf(5, bd);
+    e2->bytes(6, &p, sizeof p);
+    e2->dispatch(uint32_t(S), 1, 1, uint32_t(32 * K));
+    e2->commit_and_wait();
+    auto e3 = g.begin();
+    e3->use(NemotronH::pipeline("nh_dsp_walk_pick"));
+    e3->buf(0, bc);
+    e3->buf(1, bl);
+    e3->buf(2, bd);
+    e3->buf(3, bt2);
+    e3->buf(4, bp2);
+    e3->buf(5, bq2);
+    e3->bytes(6, &p, sizeof p);
+    e3->dispatch(1, 1, 1, 32);
+    e3->commit_and_wait();
+    const bool same = !memcmp(bt.ptr(), bt2.ptr(), 64) && !memcmp(bp.ptr(), bp2.ptr(), size_t(S) * 4) &&
+                      !memcmp(bql.ptr(), bq2.ptr(), size_t(S) * K * 4);
+    report(walk_name("nh_dsp_walk two-pass", V, R, K).c_str(), same ? 0.0 : 1.0, 0);
+  }
+  report(walk_name("nh_dsp_walk log-probs", V, R, K).c_str(), err, 1e-4);
 }
 
 void check_sums() {
@@ -786,7 +822,9 @@ int main() {
   g.compile_extra("Nemotron-H", kNhKernelSource);
   check_attn();
   check_mask_rows();
-  check_walk();
+  check_walk(77, 48, 5);
+  check_walk(2000, 512, 16);  // (Lightning's Markov rank and default candidates; NI_DSPARK_K's maximum)
+  check_walk(2000, 512, 32);
   check_sums();
   check_xb_v8();
   check_moe_ah();
