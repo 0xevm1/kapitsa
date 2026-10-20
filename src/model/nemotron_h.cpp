@@ -1186,6 +1186,20 @@ void NemotronH::alloc_buffers() {
   }
 }
 
+int NemotronH::wide_chunk(const std::string& path) {
+  // Lightning (nh_eval, 4K / 16K-token prompts, M5 Max): 752 / 3048 against 790 / 3198 ms with 2048-row chunks, 8192
+  // rows 3113 at 16K; NI_NH_WIDE_CHUNK=0: 2048. The MoE models whose prefill stays on the GPU alone (Lightning).
+  if (const char* v = getenv("NI_NH_WIDE_CHUNK"); v && !atoi(v)) return 0;
+  if (const char* v = getenv("NI_NH_TG"); v && !atoi(v)) return 0;
+  if (Gpu::get().apple_family() < 10) return 0;
+  if (__builtin_available(macOS 26.0, *)) {
+    // not where the Neural Engine split runs the prefill (Bolt, Super-VL): it takes chunks of up to 2048 rows
+    const NhConfig c = read_config(path);
+    return dense_model(c) || ane_plan_bytes(c, 0) ? 0 : 4096;
+  }
+  return 0;
+}
+
 MemPlan NemotronH::plan(const std::string& path, int prefill_chunk) {
   MemPlan m;
   if (!is_model(path)) return m;
