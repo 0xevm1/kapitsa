@@ -5,6 +5,10 @@
 //                                                       format (tools/ni_eval.cpp; llama.cpp's logits through
 //                                                       bench/quality/llama_ref.cpp)
 //   nh_eval <dir> --dump-ref F @ids...             writes such a file from this model
+//   nh_eval <dir> --vcheck N F @ids                prefill of the first N ids, then the rest teacher-forced in verify
+//                                                       passes of 8 rows (the last one shorter) (all rows, no drafter); writes their logits (fp32
+//                                                       [rows][vocab]) to F, and with NH_VCHECK_STEP=1 the one-row
+//                                                       decode path's instead (tools/nh_vcheck.py compares two)
 //   nh_eval <dir> --gen N [--temp T] [--spec] @ids  prefill + N decoded tokens: ids, prefill and decode speed;
 //                                                       --spec decodes with the block drafter (LiLiCorr, DSpark)
 //                                                       found next to the model or named by --drafter DIR (tokens
@@ -94,7 +98,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::string model = argv[1], ref_file, dump_file, drafter;
-  int gen = -1, chunk = 512, topk = 64;
+  int gen = -1, chunk = 512, topk = 64, vcheck = -1;
+  std::string vcheck_file;
   std::vector<int> skips;
   std::vector<std::string> image_files;
   bool spec = false;
@@ -109,6 +114,7 @@ int main(int argc, char** argv) {
     if (a == "--ref") ref_file = next();
     else if (a == "--dump-ref") dump_file = next();
     else if (a == "--gen") gen = std::stoi(next());
+    else if (a == "--vcheck") vcheck = std::stoi(next()), vcheck_file = next();
     else if (a == "--temp") temp = std::stof(next());
     else if (a == "--spec") spec = true;
     else if (a == "--drafter") drafter = next(), spec = true;
@@ -162,6 +168,52 @@ int main(int argc, char** argv) {
     s.embeds = runs.empty() ? nullptr : &runs;
   };
 
+  if (vcheck >= 0) {
+    const std::vector<int>& p = ids[0];
+    const int n = vcheck, L = int(p.size());
+    if (n < 1 || n >= L) fatal("--vcheck %d: the sequence has %d ids", n, L);
+    auto s = m.new_seq(L + 64);
+    memcpy(s->tokens(), p.data(), p.size() * 4);
+    std::vector<vision::EmbedRun> runs;
+    set_images(*s, p, runs);
+    SamplingParams sp;
+    for (int p0 = 0; p0 < n; p0 += m.prefill_chunk()) {
+      const int T = std::min(m.prefill_chunk(), n - p0);
+      auto e = g.begin();
+      m.encode_prefill(*e, *s, p0, T, sp, 0, p0 + T == n);
+      e->commit_and_wait();
+      if (!m.ane_finish_chunk()) fatal("the Neural Engine split failed on a chunk (rerun with NI_ANE=0)");
+    }
+    memcpy(s->tokens(), p.data(), p.size() * 4);  // (the prefill sampled tokens[n]: the given one goes back)
+    const bool step = getenv("NH_VCHECK_STEP") && atoi(getenv("NH_VCHECK_STEP"));
+    FILE* f = fopen(vcheck_file.c_str(), "wb");
+    if (!f) fatal("cannot write %s", vcheck_file.c_str());
+    Buffer out = g.alloc(size_t(8) * V * 4, "vcheck_logits");
+    int rows = 0;
+    for (int P = n; P < L; P += 8) {
+      const int R = std::min(8, L - P);
+      if (step) {
+        for (int r = 0; r < R; ++r) {
+          auto e = g.begin();
+          m.encode_logits_rows(*e, *s, P + r, 1, out.view(size_t(r) * V * 4, size_t(V) * 4));
+          e->commit_and_wait();
+        }
+        fwrite(out.as<float>(), 4, size_t(R) * V, f);
+      } else {
+        auto e = g.begin();
+        m.encode_verify(*e, *s, P, R);
+        e->commit_and_wait();
+        fwrite(m.logits(), 4, size_t(R) * V, f);
+        m.commit_rows(*s, R);
+      }
+      rows += R;
+    }
+    fclose(f);
+    printf("vcheck: %d rows of %d logits from position %d (%s) -> %s\n", rows, V, n, step ? "one-row decode" : "8-row verify",
+           vcheck_file.c_str());
+    return 0;
+  }
+
   if (gen >= 0) {
     const std::vector<int>& p = ids[0];
     const int n = int(p.size());
@@ -171,7 +223,7 @@ int main(int argc, char** argv) {
     sp.temperature = temp;
     sp.top_p = 0.95f;
     sp.top_k = 20;
-    sp.seed = 1234;
+    sp.seed = getenv("NI_SEED") ? uint32_t(strtoul(getenv("NI_SEED"), nullptr, 10)) : 1234;
     std::unique_ptr<NhDrafter> lili;
     std::unique_ptr<LiliSeq> d;
     if (spec) {
