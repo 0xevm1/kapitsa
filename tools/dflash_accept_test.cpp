@@ -15,10 +15,11 @@
 //    regime (q = p at the first proposal, q = 0.9 / 0.1 vs p = 1/2 at the second: that rule emits 0.55 / 0.45).
 // 3. KFlash tree verifies: the shared builder (kf_build) takes a best-first tree from a synthetic DFlash2 lattice
 //    (random, or aligned with the target's likely path; the identity or a random calibration; 1-8 live rows of an
-//    8-row verify, one count allowed, or every count 1-8 under the size rule, n per trial: the MoE targets'), the
-//    target's rows of the tree's paths are sampled by sample_stage2_rows_tree (top-k, top-p, temperature as the
-//    engine's sampler, each row with the uniform of its token's position; the live rows alone), the shared kf_accept
-//    walks them; a second cycle runs when one token came out.
+//    8-row verify, one count allowed, or every count 1-8 under the size rule, n per trial: the MoE targets'; the
+//    wide verifies' 16 and 32 rows, and the size rule choosing among 8 | 16 | 32 by cost), the target's rows of the
+//    tree's paths are sampled by sample_stage2_rows_tree (top-k, top-p, temperature as the engine's sampler, each row
+//    with the uniform of its token's position; the live rows alone), the shared kf_accept walks them; a second cycle
+//    runs when one token came out.
 //    The joint law of the first two tokens is tested as in 2, and every trial's two tokens must equal plain decoding's
 //    with the same position-keyed uniforms (the sampler transcribed on the CPU); T = 0: equal to the argmax decoding.
 #include "metal/gpu.h"
@@ -398,7 +399,9 @@ int tree_cases(long trials, uint64_t salt, int only) {
     float temp, top_p;
     int top_k;
     bool cal;  // a random per-depth calibration (alpha, beta) instead of the identity (the law must not depend on it)
-    int R;     // live rows (the budget allows this count alone); 0: every count 1 .. 8, the size rule picks n per trial
+    int R;     // live rows (the budget allows this count alone; 16 / 32: a wide verify of that many rows); 0: every
+               // count 1 .. 8, the size rule picks n per trial; -1: the size rule over 8 | 16 | 32 (the wide verifies'
+               // counts) with costs that make every count win in some trials
     float rate = 0.0f;  // the rule's cases: the recent tokens per ms (E(n) - rate cost[n]; 0: E(n) / cost[n])
   };
   const std::vector<TCase> cases = {{kRandom, 0.6f, 0.95f, 20, false, 8}, {kEqual, 0.6f, 0.95f, 20, true, 8},
@@ -407,15 +410,22 @@ int tree_cases(long trials, uint64_t salt, int only) {
                                     {kEqual, 0.6f, 0.95f, 20, true, 1},   {kEqual, 0.6f, 0.95f, 20, true, 0},
                                     {kRandom, 0.6f, 0.95f, 20, false, 0}, {kEqual, 0.0f, 1.0f, 1, true, 0},
                                     {kEqual, 0.6f, 0.95f, 20, true, 0, 0.1f},
-                                    {kRandom, 0.0f, 1.0f, 1, false, 0, 0.06f}};
+                                    {kRandom, 0.0f, 1.0f, 1, false, 0, 0.06f},
+                                    // the wide verifies (dense targets): 16 and 32 rows, and the rule over 8 | 16 | 32
+                                    {kEqual, 0.6f, 0.95f, 20, true, 16},  {kRandom, 0.6f, 0.95f, 20, false, 32},
+                                    {kPoint, 0.6f, 0.95f, 20, true, 32},  {kEqual, 1.0f, 1.0f, 32, true, 32},
+                                    {kEqual, 0.0f, 1.0f, 1, true, 32},    {kRandom, 0.0f, 1.0f, 1, false, 16},
+                                    {kEqual, 0.6f, 0.95f, 20, true, -1},  {kEqual, 0.0f, 1.0f, 1, true, -1},
+                                    {kRandom, 0.6f, 0.95f, 20, false, -1}};
   Pipeline table_p = g.pipeline("dfl_kf_table"), build_p = g.pipeline("kf_build"),
            samp_p = g.pipeline("sample_stage2_rows_tree"), acc_p = g.pipeline("kf_accept");
-  const int B = 2048, W = kf::kWords;
+  const int B = 2048, W = kf::kWords, RM = kf::kMaxRows;
+  constexpr int TS = 48;  // tokens per trial: the anchor's position P <= 1, its rows P .. P + 31, the token after them
   Buffer ci = g.alloc(size_t(B) * 112 * 4), cv = g.alloc(size_t(B) * 112 * 4), E = g.alloc(size_t(B) * 1792 * 4);
   Buffer clq = g.alloc(size_t(B) * 1792 * 4), ctok = g.alloc(size_t(B) * 1792 * 4), next = g.alloc(1792 * 4);
-  Buffer tok = g.alloc(size_t(B) * 16 * 4), tree = g.alloc(size_t(B) * W * 4), live = g.alloc(size_t(B) * 16);
-  Buffer rv = g.alloc(size_t(B) * 8 * kTreeN * 4);
-  Buffer rid = g.alloc(size_t(B) * 8 * kTreeN * 4), samp = g.alloc(size_t(B) * 8 * 4), res = g.alloc(size_t(B) * 16);
+  Buffer tok = g.alloc(size_t(B) * TS * 4), tree = g.alloc(size_t(B) * W * 4), live = g.alloc(size_t(B) * 16);
+  Buffer rv = g.alloc(size_t(B) * RM * kTreeN * 4);
+  Buffer rid = g.alloc(size_t(B) * RM * kTreeN * 4), samp = g.alloc(size_t(B) * RM * 4), res = g.alloc(size_t(B) * 16);
   Buffer gst = g.alloc(size_t(B) * 64), path = g.alloc(size_t(B) * kf::kPathWords * 4);
   {
     const std::vector<int32_t> nx = kf::lattice_next(7, 16);
@@ -428,10 +438,12 @@ int tree_cases(long trials, uint64_t salt, int only) {
     const int tgt = cs.regime == kPoint ? kPoint : kRandom;
     const int lat = cs.regime == kEqual ? kEqual : kRandom;
     std::map<long, long> obs, obs1;
-    long done = 0, path_bad = 0, compared = 0, nhist[9] = {};
+    long done = 0, path_bad = 0, compared = 0, nhist[kf::kMaxRows + 1] = {};
     double mean_a = 0;
     std::mt19937_64 hr(4321 + cix * 7 + salt * 1000003);
     KfParams kp{};
+    const bool wide_rule = cs.R < 0;  // the size rule over 8 | 16 | 32
+    const int cap = wide_rule ? RM : std::max(8, cs.R);  // the verify's rows (the builder's max)
     {  // the budget's parameters the builder reads: the identity, or a random calibration; this case's rows alone
       std::uniform_real_distribution<float> U(0, 1);
       for (int d = 0; d <= kf::kMaxRows; ++d) {
@@ -440,11 +452,17 @@ int tree_cases(long trials, uint64_t salt, int only) {
         kp.cost[d] = 1.0f;
       }
       kp.force_n = 0;
-      // the size rule's cases: every count, a cycle's cost growing with its rows (a MoE verify's experts)
-      kp.allowed = cs.R ? 1u << (cs.R - 1) : 0xffu;
+      // the size rule's cases: every count 1 .. 8, a cycle's cost growing with its rows (a MoE verify's experts); or
+      // 8 | 16 | 32, the wider verifies costing more, so a tree's breadth decides (each count gets picked)
+      kp.allowed = wide_rule ? (1u << 7) | (1u << 15) | (1u << 31) : cs.R ? 1u << (cs.R - 1) : 0xffu;
       if (!cs.R)
         for (int nn = 1; nn <= 8; ++nn) kp.cost[nn] = 8.0f + float(nn);
-      kp.max_rows = 8;
+      if (wide_rule) {
+        kp.cost[16] = 1.25f;
+        kp.cost[32] = 1.6f;
+      }
+      kp.max_rows = cap;
+      kp.cap = cap;
       kp.rate = cs.rate;
     }
     // the rule's choice from the descriptor's E(n) (kf_build's: the first n maximizing E(n) - rate cost[n], rate 0:
@@ -469,8 +487,8 @@ int tree_cases(long trials, uint64_t salt, int only) {
       const int n = int(pre.size());
       for (int i = 0; i < n; ++i) {
         lattice(pre[i], lat, hr, ci.as<int>() + i * 112, cv.as<float>() + i * 112, E.as<float>() + i * 1792);
-        int* tk = tok.as<int>() + i * 16;
-        for (int j = 0; j < 16; ++j) tk[j] = 0;  // tokens[0]: the first anchor (outside the universe)
+        int* tk = tok.as<int>() + i * TS;
+        for (int j = 0; j < TS; ++j) tk[j] = 0;  // tokens[0]: the first anchor (outside the universe)
         for (size_t j = 0; j < pre[i].size(); ++j) tk[1 + j] = pre[i][j];  // the anchor at P = pre.size()
       }
       {  // the trees: the lattice's tables, then the shared builder
@@ -485,22 +503,23 @@ int tree_cases(long trials, uint64_t salt, int only) {
           e->use(build_p);
           e->buf(0, clq, size_t(i) * 1792 * 4); e->buf(1, ctok, size_t(i) * 1792 * 4); e->buf(2, next);
           e->val(3, kp);
-          e->buf(4, tree, size_t(i) * W * 4); e->buf(5, tok, size_t(i) * 64); e->buf(6, live, size_t(i) * 16);
+          e->buf(4, tree, size_t(i) * W * 4); e->buf(5, tok, size_t(i) * TS * 4); e->buf(6, live, size_t(i) * 16);
           e->val(7, bp);
           e->dispatch(1, 1, 1, 32);
         }
         e->commit_and_wait();
       }
-      for (int i = 0; i < n; ++i) {  // the target's rows: slot t's path from the tree
-        const int* tk = tok.as<int>() + i * 16;
+      for (int i = 0; i < n; ++i) {  // the target's rows: slot t's path from the tree (the verify's rows, all cap)
+        const int* tk = tok.as<int>() + i * TS;
         const int* tr = tree.as<int>() + i * W;
         const int P = int(pre[i].size());
-        for (int t = 0; t < 8; ++t) {
+        for (int t = 0; t < cap; ++t) {
           std::vector<int> nodes;
           for (int v = t; v > 0; v = tr[kf::kPar + v]) nodes.push_back(tk[P + v]);
           std::vector<int> pp = pre[i];
           pp.insert(pp.end(), nodes.rbegin(), nodes.rend());
-          target_row(pp, tgt, rv.as<float>() + (i * 8 + t) * kTreeN, rid.as<uint32_t>() + (i * 8 + t) * kTreeN);
+          target_row(pp, tgt, rv.as<float>() + (size_t(i) * RM + t) * kTreeN,
+                     rid.as<uint32_t>() + (size_t(i) * RM + t) * kTreeN);
         }
       }
       {
@@ -509,14 +528,14 @@ int tree_cases(long trials, uint64_t salt, int only) {
           const uint32_t P = uint32_t(pre[i].size());
           kp::SampleRows sr{uint32_t(kTreeN), uint32_t(cs.top_k), cs.temp, cs.top_p, seed[i], P, 0, 0, 0};
           e->use(samp_p);
-          e->buf(0, rv, size_t(i) * 8 * kTreeN * 4); e->buf(1, rid, size_t(i) * 8 * kTreeN * 4);
-          e->buf(2, samp, size_t(i) * 32);
+          e->buf(0, rv, size_t(i) * RM * kTreeN * 4); e->buf(1, rid, size_t(i) * RM * kTreeN * 4);
+          e->buf(2, samp, size_t(i) * RM * 4);
           e->val(3, sr);
           e->buf(4, rid); e->buf(5, tree, size_t(i) * W * 4);
-          e->dispatch(8, 1, 1, 1024);
-          const kp::KfAccept ap{P, 8u, 1u, 0u};
+          e->dispatch(uint32_t(cap), 1, 1, 1024);
+          const kp::KfAccept ap{P, uint32_t(cap), 1u, 0u};
           e->use(acc_p);
-          e->buf(0, samp, size_t(i) * 32); e->buf(1, tok, size_t(i) * 64); e->buf(2, tree, size_t(i) * W * 4);
+          e->buf(0, samp, size_t(i) * RM * 4); e->buf(1, tok, size_t(i) * TS * 4); e->buf(2, tree, size_t(i) * W * 4);
           e->buf(3, res, size_t(i) * 16);
           e->val(4, ap);
           e->buf(5, live, size_t(i) * 16); e->buf(6, path, size_t(i) * kf::kPathWords * 4); e->buf(7, gst, size_t(i) * 64);
@@ -528,13 +547,13 @@ int tree_cases(long trials, uint64_t salt, int only) {
       for (int i = 0; i < n; ++i) {
         const int a = res.as<int>()[i * 4], P = int(pre[i].size());
         const int* tr = tree.as<int>() + i * W;
-        for (int j = 1; j <= a + 1; ++j) out[i].push_back(tok.as<int>()[i * 16 + P + j]);
+        for (int j = 1; j <= a + 1; ++j) out[i].push_back(tok.as<int>()[i * TS + P + j]);
         if (out[i].back() != res.as<int>()[i * 4 + 1]) ++path_bad;  // the token after the path
-        const int nx = cs.R ? cs.R : rule_n(tr);
+        const int nx = cs.R > 0 ? cs.R : rule_n(tr);
         if (tr[kf::kN] != nx || int(live.as<uint32_t>()[i * 4]) != nx || tr[kf::kA] != a || tr[kf::kObs] != nx)
           ++path_bad;
         if (a > nx - 1) ++path_bad;
-        if (P == 0) nhist[std::clamp(nx, 0, 8)]++;
+        if (P == 0) nhist[std::clamp(nx, 0, int(kf::kMaxRows))]++;
         if (int(gst.as<uint32_t>()[i * 16]) != P + a + 1 || int(gst.as<uint32_t>()[i * 16 + 1]) != a + 1) ++path_bad;
         for (int j = 0; j <= a; ++j)  // the path: rows of the accepted branch, the drafter state's and the sequence's
           if (path.as<int>()[i * kf::kPathWords + j] != tr[kf::kPath + j] ||
@@ -601,12 +620,14 @@ int tree_cases(long trials, uint64_t salt, int only) {
     const bool greedy = cs.temp <= 0;
     // the rule's cases must reach several counts (else they test one count again)
     int counts = 0;
-    for (int nn = 1; nn <= 8; ++nn) counts += nhist[nn] > 0;
+    for (int nn = 1; nn <= kf::kMaxRows; ++nn) counts += nhist[nn] > 0;
     const bool ok = (greedy || (pv > 0.01 && pv1 > 0.01)) && out == 0 && out1 == 0 && path_bad == 0 &&
-                    (cs.R || counts >= 3);
-    char rows[128];
-    if (cs.R) {
+                    (cs.R > 0 || counts >= (wide_rule ? 2 : 3));
+    char rows[160];
+    if (cs.R > 0) {
       snprintf(rows, sizeof rows, "%d rows", cs.R);
+    } else if (wide_rule) {
+      snprintf(rows, sizeof rows, "rule 8|16|32 (%ld/%ld/%ld)", nhist[8], nhist[16], nhist[32]);
     } else {
       int o = cs.rate > 0 ? snprintf(rows, sizeof rows, "rate rule (%.2f) over 1-8 rows (trials by n", cs.rate)
                           : snprintf(rows, sizeof rows, "rule over 1-8 rows (trials by n");
@@ -816,6 +837,61 @@ int cost_check() {
     b.write(p);
     check(p.force_n == 0 && std::fabs(p.cost[1] - cost(1, 28.0)) < 0.6, "loaded, +7 ms: 1 row's cost from the base",
           p.cost[1], cost(1, 28.0));
+  }
+  // Wide verifies (Qwen's 16 and 32 rows, KfBudget::set_wide): a cache of 8-row verifies read by a budget whose verify may
+  // also run 16 and 32 rows (the wide run's first cycle verifies capacity 8, which sets its base; then every allowed count
+  // twice), the capacity back to 8 when the wider counts don't pay, and a wide cache read by an NI_KFLASH_ROWS=8 run,
+  // which keeps 8 rows.
+  auto wcost = [](int n, double base) { return base + 0.9 * (n - 1) + (n > 8 ? 2.0 : 0.0); };
+  auto wtok = [](int) { return 1.0f; };  // (a flat expected yield: rows past 8 don't pay)
+  auto wcycle = [&](KfBudget& b, int n, int cap, double ms, int a) {
+    tree[kf::kObs] = n;
+    const float e = wtok(n);
+    memcpy(&tree[kf::kObs + 1], &e, 4);
+    tree[kf::kObs + 2] = cap;  // the capacity the verify ran at (8: the 8-row verify; 0: max_rows)
+    tree[kf::kObs + 3] = 32;   // (a whole build: the E(n) of 8, 16 and 32 rows feed the capacity decision)
+    for (int n = 0; n < 3; ++n) {
+      const float en = wtok(n ? (n == 1 ? 16 : 32) : 8);
+      memcpy(&tree[kf::kObs + 4 + n], &en, 4);
+    }
+    tree[kf::kN] = 8;
+    tree[kf::kA] = a;
+    b.observe(tree.data(), ms);
+  };
+  {
+    KfBudget b("c");  // the table the block above saved: 8-row verifies
+    b.set_rows((1u << 7) | (1u << 15) | (1u << 31), 32);
+    b.set_wide(true);
+    KfParams p{};
+    b.write(p);
+    check(p.cap == 8 && p.force_n == 0, "wide, a cache of 8-row verifies: the first cycle verifies capacity 8", p.cap, 8);
+    check(p.allowed == 0x80u, "wide: capacity 8 offers the 8-row verify only", p.allowed, 0x80);
+    wcycle(b, 8, p.cap, wcost(8, 28.0), 0);
+    b.write(p);
+    check(p.cap == 0 && p.force_n == 8, "wide: then a wide 8-row verify sets the base", p.force_n, 8);
+    wcycle(b, 8, p.cap, wcost(8, 28.0) + 0.3, 0);
+    int seen16 = 0, seen32 = 0;
+    for (int i = 0; i < 12 && !(seen16 && seen32); ++i) {
+      b.write(p);
+      const int n = p.force_n ? p.force_n : 8;
+      seen16 += n == 16, seen32 += n == 32;
+      wcycle(b, n, p.cap, wcost(n, 28.0), 0);
+    }
+    check(seen16 > 0 && seen32 > 0 && p.cap == 0, "wide: every allowed count measured twice, 16 and 32", seen32, 1);
+    for (int i = 0; i < 40; ++i) {  // (32 cycles on, the destructor saves the wide table)
+      b.write(p);
+      wcycle(b, p.cap ? 8 : (p.force_n ? p.force_n : 8), p.cap, wcost(8, 28.0), 0);
+    }
+    b.write(p);
+    check(p.cap == 8, "wide: the wider counts don't pay, the capacity stays 8", p.cap, 8);
+  }
+  {
+    KfBudget b("c");         // now a wide table
+    b.set_rows(1u << 7, 8);  // NI_KFLASH_ROWS=8 on the same model
+    KfParams p{};
+    b.write(p);
+    check(p.max_rows == 8 && p.allowed == 0x80u && p.cap == 0, "the wide cache read by an 8-row run: 8 rows only",
+          p.max_rows, 8);
   }
   log_level() = lvl;
   const std::string kdir = dir + "/kflash";

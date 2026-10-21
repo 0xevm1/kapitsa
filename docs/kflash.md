@@ -146,8 +146,9 @@ for each row count. The first cycles try every allowed count three times, unless
 **The choice.** The budget picks the size with the most expected tokens per millisecond. In practice it takes the n
 with the largest E(n) − r · cost(n), where r is the tokens per millisecond of the recent cycles: a row goes in when its
 expected tokens beat what its milliseconds would earn at the going rate. Its first 16 cycles, before r exists, use
-E(n) / cost(n). Which counts it may choose depends on the target. Dense models verify whole 8-row tiles, because their
-cost doesn't depend on the count. MoE targets may choose any count from 1 to 8.
+E(n) / cost(n). Which counts it may choose depends on the target. Dense models verify whole 8-row tiles; where
+`NI_KFLASH_ROWS` names 16 and 32 as well, a dense model's budget measures those tiles on this Mac and may pick them per
+cycle (below). MoE targets may choose any count from 1 to 8.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/kflash-budget-dark.svg">
@@ -197,13 +198,28 @@ in a different order. Three changes make a row's numbers depend on its position 
 - **The Gated DeltaNet update pinned** to one rounding order in tree verifies. It is a precaution: it changed no output
   we measured.
 
-### Eight rows, not sixteen
+### Eight rows by default, sixteen or thirty-two on request
 
-We built 16- and 32-row tree verifies for the dense models. On the 27B's coding answer they raised tokens per cycle
-from 5.16 to 5.81 and 6.01, +13% and +16%. But at 4-bit an 8-row verify already keeps the GPU's matrix units busy, and
-the cycle cost 1.73× and 3.32× as much (Figure 2, right). The release stops at one tile. With bf16 weights the verify is
-bound by memory instead: 16 rows cost 1.05× an 8-row verify, and the 4B ran 11-16% faster with the sizes forced. Wider
-trees may come back for higher-precision weights.
+We built 16- and 32-row tree verifies for the dense models, and this release ships them behind `NI_KFLASH_ROWS`: the
+default is one 8-row tile everywhere, and naming `8,16,32` lets the budget measure the wider tiles on the Mac and pick
+them per cycle.
+
+Their first version cost 1.73× and 3.32× an 8-row verify, because the verify's GEMMs ran one 8-row tile per weight
+read, so 16 rows streamed every weight twice. The tile-pair MLP (`qmm8t2`) multiplies two tiles per weight load, which
+takes the 27B's verify cycle on a coding answer from 16.70 ms at 8 rows to 17.92 at 16 (1.07×) and 24.96 at 32 (1.49×),
+against 1.55× and ~2.7× before it (the author's cycle timings on an M5-class Mac, not re-run by the reviewers).
+
+What is checked: `kflash_wide_check` (a wide verify against plain decoding on random trees of 9 to 32 live rows) passes on
+the 4B and the 27B, with every live row's argmax equal to plain decoding's and a max logit difference of 0.008 (0.0003 of a
+row's range) on an M5 Pro; the default path (8 rows) is bitwise identical to main on the 4B (`logit_compare`). What is not
+checked: a whole-reply comparison of a wide run, and the throughput gain. Earlier runs on the harness corpus showed more
+tokens per cycle with the wider tiles, but the 27B's decode over repetitions at T=0.6 spread by 5 to 6 tok/s, so no tok/s
+gain over the 8-row default or against mlx-serve is claimed here; that needs a paired A/B.
+
+So the tiles are opt-in: one tile is the setting the default's cost table is tuned for, and a Mac where the budget's
+measurements say a wider verify pays (the 27B and the 4B at 4-bit do, on prose and coding answers) can have it without
+paying the narrow cost elsewhere. With bf16 weights the verify is bound by memory instead: 16 rows cost 1.05× an 8-row
+verify, and the 4B ran 11-16% faster with the sizes forced.
 
 ### The drafters as published
 
