@@ -891,10 +891,11 @@ void DFlash2::dbg(Encoder& e, const std::string& name, const Buffer& src, size_t
 }
 
 // The drafter's 4-bit GEMMs on the core before dfl_q8_run4: dfl_q8_run4 (two groups per step, the next step's loads
-// first, subnormal codes) was measured on the M5 only, so other Macs keep the earlier core (NI_DFLASH_CORE4=1 / 0
-// forces it).
+// first, subnormal codes) is measured on M5 and the 32-core M1 Max. Other Macs
+// keep the earlier core; NI_DFLASH_CORE4=1 / 0 forces the new / earlier one.
 static bool dfl_old4() {
-  static const bool old = getenv("NI_DFLASH_CORE4") ? atoi(getenv("NI_DFLASH_CORE4")) == 0 : !Gpu::get().apple10();
+  static const bool old = getenv("NI_DFLASH_CORE4") ? atoi(getenv("NI_DFLASH_CORE4")) == 0
+      : !(Gpu::get().apple10() || (Gpu::get().name() == "Apple M1 Max" && Gpu::get().core_count() == 32));
   return old;
 }
 

@@ -736,6 +736,7 @@ this Mac, on `127.0.0.1:8000`) in the background and at each login, restarting i
 | `HF_ENDPOINT` | `https://huggingface.co` | A Hugging Face mirror. |
 | `HF_HOME`, `HF_HUB_CACHE` | `~/.cache/huggingface`, `$HF_HOME/hub` | The Hugging Face cache, whose files downloads reuse. |
 | `NI_LOG` | `1` | `0` quiet, `1` a line per request with its timings, `2` debug. |
+| `NI_DFLASH_CORE4` | Auto | `1` selects the newer four-row 4-bit drafter core, `0` the earlier core. Auto uses the newer core on Apple10 and the 32-core M1 Max. |
 | `NI_MEM_BUDGET` | | The GPU memory budget in GB, as `--mem-budget`. |
 | `NI_ANE` | on where supported | `0` keeps prefill on the GPU, without the Neural Engine. |
 | `NI_ANE_KEEP_S` | `300` | Seconds after the last prefill chunk (or model load) during which a background evaluation keeps the Neural Engine awake, so a short prompt after a pause skips its 70–120 ms wake. `0` turns it off. |
