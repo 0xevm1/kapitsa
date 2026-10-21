@@ -63,6 +63,28 @@ NI_INLINE void qrm_acc(const device half* X, const device uint* xrows, bool gath
   uint4 xr[XL];
   uint wr[NP * FA * WPL];
   half2 sb[NP * FA];
+  // Stage two of the original 32-input tiles together: half as many barriers,
+  // with the same dequantized operands and MMA addition order as BK=32.
+  if (BK == 64) {
+    constexpr int XL32 = (BMl * 4 + NT - 1) / NT;
+    uint xo32[XL32];
+    qrm_xoff<BMl, 32, NT>(xrows, gather, x_ld / 8, m0, rows, tid, xo32);
+    uint4 x0[XL32], x1[XL32];
+    uint w0[NP * FA], w1[NP * FA];
+    for (uint k0 = 0; k0 < K; k0 += 64) {
+      qrm_load_x<BMl, 32, NT>(X4, xo32, k0, x0);
+      qrm_load_x<BMl, 32, NT>(X4, xo32, k0 + 32, x1);
+      qr_store_x<BMl, 32, NT>(xs, tid, x0);
+      qr_store_x<BMl, 32, NT>(xs + BMl * 40, tid, x1);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      qr_load_w<FA, 32, NP>(W, S, B, wrow, wpr, gpr, k0, c, w0, sb);
+      qr_mma<NP * FA, FL, 32, BMl, 0>(acc, xs, 0, w0, sb);
+      qr_load_w<FA, 32, NP>(W, S, B, wrow, wpr, gpr, k0 + 32, c, w1, sb);
+      qr_mma<NP * FA, FL, 32, BMl, 0>(acc, xs + BMl * 40, 0, w1, sb);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return;
+  }
   for (uint k0 = 0; k0 < K; k0 += BK) {
     qrm_load_x<BMl, BK, NT>(X4, xo, k0, xr);
     qr_load_w<FA, BK, NP>(W, S, B, wrow, wpr, gpr, k0, c, wr, sb);
@@ -135,7 +157,7 @@ NI_INLINE void qrm_dn_body(const device half* X, uint x_ld, uint m0, uint rows, 
       uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],                \
       uint lane [[thread_index_in_simdgroup]]) {                                                           \
     if (tg.y >= ntiles[0]) return;                                                                         \
-    threadgroup uint4 xs4[8 * FB * (BK + 8) / 8];                                                          \
+    threadgroup uint4 xs4[8 * FB * (BK == 64 ? 80 : BK + 8) / 8];                                        \
     const uint e = tiles[tg.y * 3 + 0], m0 = tiles[tg.y * 3 + 1], rows = tiles[tg.y * 3 + 2] - m0;         \
     const bool sh = e == p.shared_e;                                                                       \
     const uint wo = sh ? 0 : e * p.w_expert_stride, so = sh ? 0 : e * p.s_expert_stride;                   \
@@ -172,7 +194,7 @@ NI_INLINE void qrm_dn_body(const device half* X, uint x_ld, uint m0, uint rows, 
       uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],                \
       uint lane [[thread_index_in_simdgroup]]) {                                                           \
     if (tg.y >= ntiles[0]) return;                                                                         \
-    threadgroup uint4 xs4[8 * FB * (BK + 8) / 8];                                                          \
+    threadgroup uint4 xs4[8 * FB * (BK == 64 ? 80 : BK + 8) / 8];                                        \
     const uint e = tiles[tg.y * 3 + 0], m0 = tiles[tg.y * 3 + 1], rows = tiles[tg.y * 3 + 2] - m0;         \
     const bool sh = e == p.shared_e;                                                                       \
     const device uint32_t* W[1] = {sh ? SWd : Wd + e * p.w_expert_stride};                                 \
@@ -201,3 +223,7 @@ NI_QRM_GU(qrm_gu_k32_m32_n64, 4, 64, 4, 32)    // 88 GPRs, no stack
 NI_QRM_GU(qrm_gu_k32_m16_n64, 2, 64, 4, 32)    // NI_MOE_QMR=16
 NI_QRM_DN(qrm_dn_k32_m32_n128, 4, 128, 4, 32)  // 85 GPRs, no stack
 NI_QRM_DN(qrm_dn_k32_m16_n128, 2, 128, 4, 32)
+NI_QRM_GU(qrm_gu_k64_m32_n64, 4, 64, 4, 64)
+NI_QRM_GU(qrm_gu_k64_m16_n64, 2, 64, 4, 64)
+NI_QRM_DN(qrm_dn_k64_m32_n128, 4, 128, 4, 64)
+NI_QRM_DN(qrm_dn_k64_m16_n128, 2, 128, 4, 64)

@@ -102,6 +102,19 @@ static int moe_qmr() {
   return v;
 }
 
+// The 35B's grouped prefill on the 32-core M1 Max benefits from staging a full
+// 64-input group per step. Other measured devices keep their 32-input tiles.
+static int moe_qmr_k(int hidden, int intermediate) {
+  static const int override_k = [] {
+    const int v = getenv("NI_MOE_QMR_K") ? atoi(getenv("NI_MOE_QMR_K")) : 0;
+    if (v != 0 && v != 32 && v != 64) fatal("NI_MOE_QMR_K=%d: expected 0, 32 or 64", v);
+    return v;
+  }();
+  if (override_k) return override_k;
+  return hidden == 2048 && intermediate == 512 && Gpu::get().name() == "Apple M1 Max" &&
+                 Gpu::get().core_count() == 32 ? 64 : 32;
+}
+
 // NI_QMM (read once): dense prefill GEMM family for 4-bit, group-64 weights.
 //   unset/empty/1 (default): qmr (qmm3.metal: weights dequantized straight into MMA registers, X
 //      staged in threadgroup memory) with the tile picked from M and N; 27B prefill 4k +19-21%,
@@ -322,8 +335,9 @@ void Qwen35::prewarm_pipelines() {
   if (Gpu::get().apple_family() <= 7)  // the M1's prefill attention and tiles (enc_attn_prefill, qmr_sel, enc_qmm_gu)
     for (const char* n : {"attn_prefill11_k16xr", "qmr_k64_w12_m32_n64", "qmr_gu_k64_w14_m32_n64"}) names.insert(n);
   if (cfg_.moe && moe_qmr()) {
-    names.insert("qrm_gu_k32_m" + std::to_string(moe_qmr()) + "_n64");
-    names.insert("qrm_dn_k32_m" + std::to_string(moe_qmr()) + "_n128");
+    const std::string k = std::to_string(moe_qmr_k(cfg_.hidden, cfg_.moe_I));
+    names.insert("qrm_gu_k" + k + "_m" + std::to_string(moe_qmr()) + "_n64");
+    names.insert("qrm_dn_k" + k + "_m" + std::to_string(moe_qmr()) + "_n128");
   }
   if (shortpf()) {
     for (int M = 1; M <= std::max(1, shortpf_max()); ++M) {
@@ -2615,7 +2629,7 @@ bool Qwen35::enc_moe_prefill_fused(Encoder& e, const Layer& L, int T, const Buff
   e.dispatch(1, 1, 1, 1024);
   const uint32_t max_tiles = uint32_t((P + bm - 1) / bm + E + (S + bm - 1) / bm);
   const std::string m = "_b4_m" + std::to_string(bm);
-  const std::string qm = "_k32_m" + std::to_string(bm);
+  const std::string qm = "_k" + std::to_string(moe_qmr_k(D, cfg_.moe_I)) + "_m" + std::to_string(bm);
   // shared expert on all rows (as in enc_moe_prefill)
   auto enc_shared = [&] {
     if (!enc_qmm_gu(e, L.sg, L.su, xh_, hh_, T)) {
