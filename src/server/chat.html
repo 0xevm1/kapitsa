@@ -17,6 +17,14 @@ button{cursor:pointer}
 header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
 header h1{margin:0;font-size:16px;font-weight:650;letter-spacing:-.01em}
 #model{color:var(--muted);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.model-wrap{display:flex;align-items:center;gap:8px}
+.model-select{color:var(--fg);background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:4px 8px;font-size:13px;font-weight:500;max-width:280px;text-overflow:ellipsis;cursor:pointer;outline:none}
+.model-select:hover:not(:disabled){border-color:var(--muted)}
+.model-select:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.model-select:disabled{opacity:.6;cursor:wait}
+.model-select optgroup{font-weight:600;color:var(--muted);background:var(--bg)}
+.model-select option{font-weight:normal;color:var(--fg);background:var(--bg)}
+.model-status{color:var(--accent);font-size:12px;font-weight:500}
 .spacer{flex:1}
 .tool{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);user-select:none}
 .tool input{margin:0}
@@ -77,7 +85,13 @@ dialog .btn{justify-self:end}
 <body>
 <header>
   <h1>Kapitsa</h1>
-  <span id="model" title="Model">connecting…</span>
+  <div class="model-wrap" title="Switch active model">
+    <select id="model-select" class="model-select" aria-label="Select Model" disabled>
+      <option value="" disabled selected>connecting…</option>
+    </select>
+    <span id="model-status" class="model-status" hidden></span>
+    <span id="model" class="sr">connecting…</span>
+  </div>
   <span class="spacer"></span>
   <label class="tool" title="Let the model reason before it answers"><input type="checkbox" id="think" checked> Thinking</label>
   <button class="btn" id="new" type="button">New chat</button>
@@ -261,18 +275,111 @@ log.addEventListener("click", (e) => {
 });
 
 // ---- talking to the server
+let switching = false;
 async function loadModel() {
   try {
     let r = await fetch("/v1/models", { headers: headers() });
     if (r.status === 401) { await askKey(); r = await fetch("/v1/models", { headers: headers() }); }
     const j = await r.json();
-    modelId = (j.data && j.data[0] && j.data[0].id) || "";
+    const list = (j.data && Array.isArray(j.data)) ? j.data : [];
+    const active = list.find((m) => m.active) || list[0];
+    modelId = (active && active.id) || (list[0] && list[0].id) || "";
     $("model").textContent = modelId || "no model";
     document.title = modelId ? "Kapitsa · " + modelId : "Kapitsa";
+
+    const sel = $("model-select");
+    sel.innerHTML = "";
+    const readyModels = list.filter((m) => m.downloaded);
+    const catalogModels = list.filter((m) => !m.downloaded);
+
+    if (readyModels.length) {
+      const g = document.createElement("optgroup");
+      g.label = "Ready on this Mac";
+      readyModels.forEach((m) => {
+        const o = document.createElement("option");
+        o.value = m.id;
+        o.textContent = m.display_name || m.id;
+        if (m.id === modelId || m.active) o.selected = true;
+        g.appendChild(o);
+      });
+      sel.appendChild(g);
+    }
+    if (catalogModels.length) {
+      const g = document.createElement("optgroup");
+      g.label = "Available in Catalog";
+      catalogModels.forEach((m) => {
+        const o = document.createElement("option");
+        o.value = m.id;
+        o.textContent = (m.display_name || m.id) + " (downloads on switch)";
+        if (m.id === modelId) o.selected = true;
+        g.appendChild(o);
+      });
+      sel.appendChild(g);
+    }
+    if (!list.length) {
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = "no models";
+      sel.appendChild(o);
+    }
+    sel.disabled = false;
   } catch {
     $("model").textContent = "server not reachable";
+    const sel = $("model-select");
+    sel.innerHTML = '<option value="">server not reachable</option>';
+    sel.disabled = true;
   }
 }
+
+async function switchModel(newModel) {
+  if (switching || !newModel || newModel === modelId) return;
+  switching = true;
+  const sel = $("model-select");
+  const stat = $("model-status");
+  const sendBtn = $("send");
+  const inputEl = $("input");
+
+  sel.disabled = true;
+  sendBtn.disabled = true;
+  stat.hidden = false;
+  stat.textContent = "Switching model…";
+  $("status").textContent = "Kapitsa is switching model.";
+
+  try {
+    const r = await fetch("/v1/models/switch", {
+      method: "POST",
+      headers: { ...headers(), "Content-Type": "application/json" },
+      body: JSON.stringify({ model: newModel })
+    });
+    const j = await r.json();
+    if (r.ok && j.status === "ok") {
+      modelId = j.model;
+      $("model").textContent = modelId;
+      document.title = "Kapitsa · " + modelId;
+      stat.textContent = "Ready!";
+      setTimeout(() => { if (!switching) stat.hidden = true; }, 2000);
+      await loadModel();
+    } else {
+      const msg = (j.error && j.error.message) ? j.error.message : "Failed to switch model";
+      alert("Error switching model: " + msg);
+      sel.value = modelId;
+      stat.hidden = true;
+    }
+  } catch (err) {
+    alert("Connection error while switching model: " + err.message);
+    sel.value = modelId;
+    stat.hidden = true;
+  } finally {
+    switching = false;
+    sel.disabled = false;
+    sendBtn.disabled = !inputEl.value.trim() && !pending.length;
+    $("status").textContent = "";
+  }
+}
+
+$("model-select").addEventListener("change", (e) => {
+  switchModel(e.target.value);
+});
 
 async function ask() {
   const text = input.value.trim();

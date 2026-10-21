@@ -237,6 +237,7 @@ screen too), otherwise to stderr; Ctrl+C stops it.
 | `--host HOST` | `127.0.0.1` | Listen address; `0.0.0.0` serves your network ([API keys and network access](#api-keys-and-network-access)). |
 | `--port PORT` | `8000` | Listen port. A port in use is an error. |
 | `--api-key KEY` | none | Require `Authorization: Bearer KEY` or `x-api-key: KEY`. |
+| `--allow-switch` | off | Let a request naming another model, or `POST /v1/models/switch`, load that model (it may download gigabytes). Off, the `model` field is ignored, as clients send names of their own. On a network `--host` it needs `--api-key`. |
 | `--model-id ID` | the model's name | The model's name in the API. |
 | `--context N` | `128k`, less where memory is tight | Context per conversation: tokens (`131072`), `k` or `m` of them (`128k`, `1m`), or `max`, the model's own limit ([Context](#context)). `--ctx N` works too. |
 | `--slots N` | `4` where memory allows, else `3` or `2` | Requests that run at once, each with its conversation's cache kept for follow-ups; more wait for a free slot, first come first served. |
@@ -354,13 +355,15 @@ OpenAI clients use the base URL `http://127.0.0.1:8000/v1`, Anthropic clients `h
 
 | Endpoint | What it is |
 | --- | --- |
-| `POST /v1/chat/completions` | OpenAI Chat Completions: `reasoning_content`, `tool_calls`, and `usage` (in a stream's last chunk) with `prompt_tokens_details.cached_tokens`. `max_tokens` defaults to 16384. |
-| `POST /v1/responses` | OpenAI Responses: reasoning items, function and custom tools, `usage.input_tokens_details.cached_tokens`. `previous_response_id` continues one of the last 64 stored responses (unknown ids are a 400). Built-in tools such as web search are left out. |
-| `POST /v1/messages` | Anthropic Messages: thinking blocks, `tool_use` and `tool_result`; `usage.input_tokens` counts the uncached prompt, `cache_read_input_tokens` the cached part. Server tools are left out. |
+| `POST /v1/chat/completions` | OpenAI Chat Completions: `reasoning_content`, `tool_calls`, and `usage` (in a stream's last chunk) with `prompt_tokens_details.cached_tokens`. `max_tokens` defaults to 16384. Automatically switches to the requested `model` on demand if different from the currently active model. |
+| `POST /v1/responses` | OpenAI Responses: reasoning items, function and custom tools, `usage.input_tokens_details.cached_tokens`. `previous_response_id` continues one of the last 64 stored responses (unknown ids are a 400). Built-in tools such as web search are left out. Supports on-demand model switching via `model`. |
+| `POST /v1/messages` | Anthropic Messages: thinking blocks, `tool_use` and `tool_result`; `usage.input_tokens` counts the uncached prompt, `cache_read_input_tokens` the cached part. Server tools are left out. Supports on-demand model switching via `model`. |
 | `POST /v1/messages/count_tokens` | Anthropic's token count of a request. |
-| `GET /v1/models` | The model being served (OpenAI's list with Anthropic's fields); `context_fit` is the tokens one conversation can hold within the memory budget, `slots` the requests that run at once. |
+| `GET /v1/models` | Available models (active model first, downloaded models, and catalog models); includes `active`, `downloaded`, `context_fit`, and `slots`. |
+| `GET /v1/models/:model` | Information about a specific model. |
+| `POST /v1/models/switch` | With `--allow-switch`: switches the active model, `{"model": "<name>"}` (403 without the flag). While it loads, other requests get 503 with `Retry-After`. A model that fails to load leaves the previous one serving. |
 | `GET /health` | `{"status":"ok"}` |
-| `GET /` | The chat page: one file that talks only to this server and keeps its conversations in the browser. |
+| `GET /` | The chat page: one file with dynamic client-side model selection dropdown that talks only to this server and keeps its conversations in the browser. |
 
 Every API streams (server-sent events) or answers in one JSON reply. A prompt longer than the context is a 400 error,
 streamed or not (Messages: "prompt is too long", which Claude Code answers by compacting; Responses and Chat

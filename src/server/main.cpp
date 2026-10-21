@@ -27,6 +27,7 @@
 #include "hub/hub.h"
 #include "metal/gpu.h"
 #include "server/cli.h"
+#include "server/model_manager.h"
 #include "server/picker.h"
 #include "server/ui.h"
 #include "util/log.h"
@@ -307,6 +308,9 @@ static void print_serve_help() {
          "  --port PORT            default 8000\n"
          "  --api-key KEY          require \"Authorization: Bearer KEY\" or \"x-api-key: KEY\" (the chat page asks for\n"
          "                         it once)\n"
+         "  --allow-switch         a request naming another model, or POST /v1/models/switch, loads it (may download\n"
+         "                         gigabytes; 503 + Retry-After meanwhile). Default off: the \"model\" field is ignored.\n"
+         "                         On a network address it needs --api-key\n"
          "  --model-id ID          the model's name in the API (default: the model's name)\n"
          "  --context N            context per conversation: tokens, k or m of them (128k, 1m), or max (the\n"
          "                         model's limit). Default: 128K, or less where this Mac's memory is tight (the\n"
@@ -417,18 +421,18 @@ struct StreamJob {
 // Runs `r` and answers it as a stream of `w`'s events, or with failure(result) when it fails before the stream starts:
 // once the prompt is matched against the slot's cache, or `early`, as soon as the request is accepted. Then calls
 // after(result) (the reply is out) from the connection's thread.
-static void stream_reply(Engine& engine, const ChatRequest& r, std::shared_ptr<api::StreamWriter> w, httplib::Response& res,
+static void stream_reply(std::shared_ptr<RequestGuard> guard, const ChatRequest& r, std::shared_ptr<api::StreamWriter> w, httplib::Response& res,
                          std::function<std::pair<int, json>(const ChatResult&)> failure,
                          std::function<void(const ChatResult&)> after, std::shared_ptr<ui::Meter> meter,
                          bool early = false) {
   auto job = std::make_shared<StreamJob>();
-  job->worker = std::thread([&engine, r, w, meter, early, raw = job.get()] {
+  job->worker = std::thread([guard, r, w, meter, early, raw = job.get()] {
     auto start = [&](const ChatResult& prompt) {  // with raw->mu held
       raw->out.push_back(w->begin(prompt));
       raw->started = true;
       raw->cv.notify_all();
     };
-    ChatResult out = engine.chat(
+    ChatResult out = guard->engine().chat(
         r,
         [&](const ChatDelta& d) {
           ui::token(meter);
@@ -471,7 +475,7 @@ static void stream_reply(Engine& engine, const ChatRequest& r, std::shared_ptr<a
     return;
   }
   res.set_header("Cache-Control", "no-cache");
-  res.set_chunked_content_provider("text/event-stream", [job, w, after, meter](size_t, httplib::DataSink& sink) {
+  res.set_chunked_content_provider("text/event-stream", [guard, job, w, after, meter](size_t, httplib::DataSink& sink) {
     // the client is gone: the engine stops at its next token, or gives the request up before it takes a slot
     auto gone = [&] {
       job->cancel();
@@ -518,12 +522,11 @@ static void stream_reply(Engine& engine, const ChatRequest& r, std::shared_ptr<a
 // returning: a signal stops it (Ctrl+C, SIGTERM from `kapitsa claude` or a service manager, SIGHUP), or its launcher's
 // exit (exit_with_parent). The engine also saves them between requests (KfBudget::kSaveEvery), for kill -9.
 static std::mutex g_stop_mu;
-static Engine* g_stop_engine = nullptr;  // while serve() serves (SaveOnStop)
+static ModelManager* g_stop_mgr = nullptr;  // while serve() serves (SaveOnStop)
 
 static void save_before_exit() {
   std::lock_guard<std::mutex> lk(g_stop_mu);
-  if (g_stop_engine) g_stop_engine->save_kflash();
-  if (g_stop_engine) g_stop_engine->save_disk_cache();  // the conversations the SSD prefix cache lacks (at most 8 s)
+  if (g_stop_mgr) g_stop_mgr->save_state();  // the engine now serving: KFlash state, the SSD prefix cache's conversations
 }
 
 // A stop signal wakes a thread that saves, then takes its course as before: the terminal UI's handler (the status
@@ -549,10 +552,10 @@ static void on_stop_signal(int sig) {
 
 // The stop handlers while it lives (serve(), from the engine's start); the previous ones come back after
 struct SaveOnStop {
-  explicit SaveOnStop(Engine& engine) {
+  explicit SaveOnStop(ModelManager& mgr) {
     {
       std::lock_guard<std::mutex> lk(g_stop_mu);
-      g_stop_engine = &engine;
+      g_stop_mgr = &mgr;
     }
     if (pipe(g_stop_pipe) != 0) return;
     for (int fd : g_stop_pipe) fcntl(fd, F_SETFD, FD_CLOEXEC);
@@ -580,7 +583,7 @@ struct SaveOnStop {
       for (int i = 0; i < 3; ++i)
         if (g_stop_prev[i].sa_handler != SIG_IGN) sigaction(kStopSignals[i], &g_stop_prev[i], nullptr);
     std::lock_guard<std::mutex> lk(g_stop_mu);
-    g_stop_engine = nullptr;
+    g_stop_mgr = nullptr;
   }
   SaveOnStop(const SaveOnStop&) = delete;
   SaveOnStop& operator=(const SaveOnStop&) = delete;
@@ -609,13 +612,22 @@ static void exit_with_parent() {
   }).detach();
 }
 
+// While a model switch loads the new model, a request gets 503 and Retry-After (it does not queue behind the load)
+static bool reject_while_switching(const ModelManager& mgr, httplib::Response& res, const std::string& body) {
+  if (!mgr.switching()) return false;
+  res.status = 503;
+  res.set_header("Retry-After", "30");
+  res.set_content(body, "application/json");
+  return true;
+}
+
 static int serve(int argc, char** argv, int first) {
   exit_with_parent();
   EngineOptions opt;
   int context_req = 0;  // --context: 0 none (default_context), kContextMax, or tokens
   std::string host = "127.0.0.1", api_key, model;
   int port = 8000;
-  bool verbose = false, yes = false;
+  bool verbose = false, yes = false, allow_switch = false;
   const char* help = "kapitsa serve --help";
   for (int i = first; i < argc; ++i) {
     std::string a = argv[i];
@@ -640,6 +652,7 @@ static int serve(int argc, char** argv, int first) {
     else if (a == "--dflash") opt.dflash = next();
     else if (a == "--prefill-chunk") opt.prefill_chunk = to_int(a, next(), help);
     else if (a == "--api-key") api_key = next();
+    else if (a == "--allow-switch") allow_switch = true;
     else if (a == "--mem-budget") opt.mem_budget_gb = to_gb(a, next(), help);
     else if (a == "--image-max-pixels") opt.image_max_pixels = to_int(a, next(), help);
     else if (a == "--disk-cache") {
@@ -674,6 +687,8 @@ static int serve(int argc, char** argv, int first) {
     if (!opt.loop_kv.empty()) parse_loop_kv(opt.loop_kv, &kv);
     Dory::set_serving(opt.loops, kv);
   }
+  if (allow_switch && api_key.empty() && host != "127.0.0.1" && host != "localhost" && host != "::1")
+    usage_error("--allow-switch on a network address needs --api-key (any client could load models)", help);
   const bool tui = term::fancy();  // a terminal: the styled screen, the engine's log in a file
   if (tui) ui::serve_begin(verbose);
   std::vector<std::string> notes;  // the terminal UI's, shown under its header once the server will start
@@ -837,15 +852,15 @@ static int serve(int argc, char** argv, int first) {
   // the server compiles the Neural Engine program in the background (no 40 s start after the ANE
   // daemon evicted it); ni_run and the benchmarks build it synchronously
   setenv("NI_ANE_ASYNC", "1", 0);
-  if (tui) ui::loading_begin(ref.name);
-  Engine engine(opt);
-  if (tui) ui::loading_end(ref.name);
-  if (tui) term::guard_signals();  // the status block's signal handlers, which the stop handlers pass the signal on to
-  SaveOnStop save_on_stop(engine);
-
   const time_t started = std::time(nullptr);
   char started_at[32];
   strftime(started_at, sizeof started_at, "%Y-%m-%dT%H:%M:%SZ", gmtime(&started));
+  auto model_mgr = std::make_shared<ModelManager>();
+  model_mgr->set_allow_switch(allow_switch);
+  model_mgr->init(opt, ref, context_req, budget, tui, started, started_at);
+  if (tui) term::guard_signals();  // the status block's signal handlers, which the stop handlers pass the signal on to
+  SaveOnStop save_on_stop(*model_mgr);
+
   api::ResponseStore responses;  // recent responses, for previous_response_id
   httplib::Server srv;
   // conversations carry their images as base64 every turn (an agent's screenshots: 1-4 MB each)
@@ -882,38 +897,89 @@ static int serve(int argc, char** argv, int first) {
     res.set_content(kChatPage, "text/html; charset=utf-8");
   });
   srv.Get("/favicon.ico", [](const httplib::Request&, httplib::Response& res) { res.status = 204; });
-  srv.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
-    // OpenAI's list and Anthropic's (type, display_name, created_at, has_more, first_id, last_id) in one
-    json j{{"object", "list"},
-           {"data", json::array({json{{"id", engine.model_id()},
-                                      {"object", "model"},
-                                      {"type", "model"},
-                                      {"display_name", engine.model_id()},
-                                      {"created", long(started)},
-                                      {"created_at", started_at},
-                                      {"owned_by", "nace"},
-                                      {"context_length", engine.context_length()},
-                                      // tokens one conversation can hold within this Mac's memory budget
-                                      {"context_fit", engine.context_fit()},
-                                      // requests that run at once (more wait for a free slot)
-                                      {"slots", engine.slots()}}})},
-           {"has_more", false},
-           {"first_id", engine.model_id()},
-           {"last_id", engine.model_id()}};
+  srv.Get("/v1/models", [model_mgr](const httplib::Request&, httplib::Response& res) {
+    res.set_content(model_mgr->list_models_json().dump(), "application/json");
+  });
+  srv.Get(R"(/v1/models/(.+))", [model_mgr](const httplib::Request& req, httplib::Response& res) {
+    const std::string mid = req.matches[1].str();
+    auto m = model_mgr->get_model_json(mid);
+    if (m.is_object() && !m.empty()) {
+      res.set_content(m.dump(), "application/json");
+    } else {
+      res.status = 404;
+      res.set_content(R"({"error":{"message":"model not found","type":"invalid_request_error"}})", "application/json");
+    }
+  });
+  srv.Post("/v1/models/switch", [model_mgr](const httplib::Request& req, httplib::Response& res) {
+    if (!model_mgr->allow_switch()) {
+      res.status = 403;
+      res.set_content(R"j({"error":{"message":"model switching is off (start the server with --allow-switch)","type":"invalid_request_error"}})j", "application/json");
+      return;
+    }
+    if (model_mgr->switching()) {
+      res.status = 503;
+      res.set_header("Retry-After", "30");
+      res.set_content(R"({"error":{"message":"another model switch is in progress","type":"server_error"}})", "application/json");
+      return;
+    }
+    std::string target;
+    try {
+      json b = json::parse(req.body);
+      target = b.value("model", "");
+    } catch (...) {
+      target = req.get_param_value("model");
+    }
+    if (target.empty()) {
+      res.status = 400;
+      res.set_content(R"({"error":{"message":"Missing 'model' parameter","type":"invalid_request_error"}})", "application/json");
+      return;
+    }
+    const std::string prev = model_mgr->current_model_id();
+    std::string err;
+    auto eng = model_mgr->switch_to(target, &err);
+    if (!eng) {
+      res.status = 400;
+      json eb{{"error", {{"message", err.empty() ? "Failed to switch model" : err}, {"type", "invalid_request_error"}}}};
+      res.set_content(eb.dump(), "application/json");
+      return;
+    }
+    json j{
+      {"status", "ok"},
+      {"model", eng->model_id()},
+      {"previous_model", prev},
+      {"context_length", eng->context_length()},
+      {"context_fit", eng->context_fit()},
+      {"slots", eng->slots()}
+    };
     res.set_content(j.dump(), "application/json");
   });
 
   // After a reply: prefill the conversation as its next request will render it (NI_HISTORY_PREFILL), in its own thread
-  auto prefill_after = [&engine](const ChatRequest& r, const ChatResult& out) {
-    std::thread([&engine, r, out] { engine.prefill_history(r, out); }).detach();
+  auto prefill_after = [model_mgr](const ChatRequest& r, const ChatResult& out) {
+    model_mgr->prefill_after(r, out);
   };
 
   srv.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
     json body;
-    ChatRequest r;
     try {
       body = json::parse(req.body);
-      r = parse_request(body, engine.request_defaults());
+    } catch (const std::exception& ex) {
+      res.status = 400;
+      res.set_content(api::dump(api::chat_error(std::string("bad request: ") + ex.what())), "application/json");
+      return;
+    }
+    const std::string req_model = body.value("model", "");
+    std::string err;
+    if (reject_while_switching(*model_mgr, res, api::dump(api::chat_error("The server is switching models; retry shortly.")))) return;
+    auto guard = model_mgr->acquire_request(req_model, &err);
+    if (!guard) {
+      res.status = 400;
+      res.set_content(api::dump(api::chat_error("Model error: " + err)), "application/json");
+      return;
+    }
+    ChatRequest r;
+    try {
+      r = parse_request(body, guard->engine().request_defaults());
     } catch (const api::ApiError& e) {
       res.status = e.status;
       res.set_content(api::dump(api::chat_error(e.what(), e.type, e.code, e.param)), "application/json");
@@ -926,20 +992,20 @@ static int serve(int argc, char** argv, int first) {
     const bool stream = body.contains("stream") && body["stream"].is_boolean() && body["stream"].get<bool>();
     const std::string id = "chatcmpl-" + std::to_string(std::time(nullptr)) + std::to_string(rand() % 100000);
     const long created = long(std::time(nullptr));
-    const std::string model = engine.model_id();
+    const std::string model = guard->engine().model_id();
     const auto meter = ui::meter(req, r);
     r.live = ui::live_of(meter);
     if (!stream) {
-      ChatResult out = engine.chat(r, [&](const ChatDelta&) {
+      ChatResult out = guard->engine().chat(r, [&](const ChatDelta&) {
         ui::token(meter);
         return true;
       });
       ui::done(meter, out);
       prefill_after(r, out);
       if (out.finish_reason == "error") {
-        auto [status, err] = api::chat_failure(out);
+        auto [status, fail_err] = api::chat_failure(out);
         res.status = status;
-        res.set_content(api::dump(err), "application/json");
+        res.set_content(api::dump(fail_err), "application/json");
         return;
       }
       json msg{{"role", "assistant"}, {"content", out.content}};
@@ -955,15 +1021,33 @@ static int serve(int argc, char** argv, int first) {
       return;
     }
     // the stream (src/api/chat_completions.cpp) starts as soon as the prompt is known to fit, before the slot
-    stream_reply(engine, r, std::make_shared<api::ChatCompletionsStream>(id, model, created), res, api::chat_failure,
+    stream_reply(guard, r, std::make_shared<api::ChatCompletionsStream>(id, model, created), res, api::chat_failure,
                  [&, r](const ChatResult& out) { prefill_after(r, out); }, meter, true);
   });
 
   // Anthropic Messages (src/api/anthropic.cpp)
   srv.Post("/v1/messages", [&](const httplib::Request& req, httplib::Response& res) {
+    json body;
+    try {
+      body = json::parse(req.body);
+    } catch (const std::exception& e) {
+      res.status = 400;
+      res.set_content(api::dump(api::messages_error("invalid_request_error", std::string("bad request: ") + e.what())),
+                      "application/json");
+      return;
+    }
+    const std::string req_model = body.value("model", "");
+    std::string err;
+    if (reject_while_switching(*model_mgr, res, api::dump(api::messages_error("overloaded_error", "The server is switching models; retry shortly.")))) return;
+    auto guard = model_mgr->acquire_request(req_model, &err);
+    if (!guard) {
+      res.status = 400;
+      res.set_content(api::dump(api::messages_error("invalid_request_error", "Model error: " + err)), "application/json");
+      return;
+    }
     api::MessagesRequest q;
     try {
-      q = api::messages_request(json::parse(req.body));
+      q = api::messages_request(body);
     } catch (const api::ApiError& e) {
       res.status = e.status;
       res.set_content(api::dump(api::messages_error(e.type, e.what())), "application/json");
@@ -974,32 +1058,41 @@ static int serve(int argc, char** argv, int first) {
                       "application/json");
       return;
     }
-    const std::string id = api::new_id("msg_"), model = engine.model_id();
+    const std::string id = api::new_id("msg_"), model = guard->engine().model_id();
     const auto meter = ui::meter(req, q.chat);
     q.chat.live = ui::live_of(meter);
     if (!q.stream) {
-      ChatResult out = engine.chat(q.chat, [&](const ChatDelta&) {
+      ChatResult out = guard->engine().chat(q.chat, [&](const ChatDelta&) {
         ui::token(meter);
         return true;
       });
       ui::done(meter, out);
       if (out.finish_reason == "error") {
-        auto [status, body] = api::messages_failure(out);
+        auto [status, fail_body] = api::messages_failure(out);
         res.status = status;
-        res.set_content(api::dump(body), "application/json");
+        res.set_content(api::dump(fail_body), "application/json");
         return;
       }
       res.set_content(api::dump(api::messages_response(id, model, out, q.show_thinking)), "application/json");
       prefill_after(q.chat, out);
       return;
     }
-    stream_reply(engine, q.chat, std::make_shared<api::MessagesStream>(id, model, q.show_thinking), res,
+    stream_reply(guard, q.chat, std::make_shared<api::MessagesStream>(id, model, q.show_thinking), res,
                  api::messages_failure, [&, r = q.chat](const ChatResult& out) { prefill_after(r, out); }, meter);
   });
   srv.Post("/v1/messages/count_tokens", [&](const httplib::Request& req, httplib::Response& res) {
     try {
-      const ChatRequest r = api::messages_prompt(json::parse(req.body));
-      res.set_content(json{{"input_tokens", engine.count_tokens(r)}}.dump(), "application/json");
+      json b = json::parse(req.body);
+      const std::string req_model = b.value("model", "");
+      if (reject_while_switching(*model_mgr, res, api::dump(api::messages_error("overloaded_error", "The server is switching models; retry shortly.")))) return;
+      auto guard = model_mgr->acquire_request(req_model);
+      if (!guard) {
+        res.status = 400;
+        res.set_content(api::dump(api::messages_error("invalid_request_error", "Model error")), "application/json");
+        return;
+      }
+      const ChatRequest r = api::messages_prompt(b);
+      res.set_content(json{{"input_tokens", guard->engine().count_tokens(r)}}.dump(), "application/json");
     } catch (const api::ApiError& e) {
       res.status = e.status;
       res.set_content(api::dump(api::messages_error(e.type, e.what())), "application/json");
@@ -1012,9 +1105,27 @@ static int serve(int argc, char** argv, int first) {
 
   // OpenAI Responses (src/api/responses.cpp)
   srv.Post("/v1/responses", [&](const httplib::Request& req, httplib::Response& res) {
+    json body;
+    try {
+      body = json::parse(req.body);
+    } catch (const std::exception& e) {
+      res.status = 400;
+      res.set_content(api::dump(api::responses_error(std::string("bad request: ") + e.what(), "invalid_request_error")),
+                      "application/json");
+      return;
+    }
+    const std::string req_model = body.value("model", "");
+    std::string err;
+    if (reject_while_switching(*model_mgr, res, api::dump(api::responses_error("The server is switching models; retry shortly.", "server_error")))) return;
+    auto guard = model_mgr->acquire_request(req_model, &err);
+    if (!guard) {
+      res.status = 400;
+      res.set_content(api::dump(api::responses_error("Model error: " + err, "invalid_request_error")), "application/json");
+      return;
+    }
     auto q = std::make_shared<api::ResponsesRequest>();
     try {
-      *q = api::responses_request(json::parse(req.body), responses);
+      *q = api::responses_request(body, responses);
     } catch (const api::ApiError& e) {
       res.status = e.status;
       res.set_content(api::dump(api::responses_error(e.what(), e.type, e.code, e.param)), "application/json");
@@ -1025,7 +1136,7 @@ static int serve(int argc, char** argv, int first) {
                       "application/json");
       return;
     }
-    const std::string id = api::new_id("resp_"), model = engine.model_id();
+    const std::string id = api::new_id("resp_"), model = guard->engine().model_id();
     const long created = long(std::time(nullptr));
     // the conversation through this response, for a later previous_response_id
     auto keep = [&responses, q, id](const ojson& output) {
@@ -1037,15 +1148,15 @@ static int serve(int argc, char** argv, int first) {
     const auto meter = ui::meter(req, q->chat);
     q->chat.live = ui::live_of(meter);
     if (!q->stream) {
-      ChatResult out = engine.chat(q->chat, [&](const ChatDelta&) {
+      ChatResult out = guard->engine().chat(q->chat, [&](const ChatDelta&) {
         ui::token(meter);
         return true;
       });
       ui::done(meter, out);
       if (out.finish_reason == "error") {
-        auto [status, body] = api::responses_failure(out);
+        auto [status, fail_body] = api::responses_failure(out);
         res.status = status;
-        res.set_content(api::dump(body), "application/json");
+        res.set_content(api::dump(fail_body), "application/json");
         return;
       }
       ojson output;
@@ -1056,7 +1167,7 @@ static int serve(int argc, char** argv, int first) {
     }
     auto w = std::make_shared<api::ResponsesStream>(*q, id, model, created);
     stream_reply(
-        engine, q->chat, w, res, api::responses_failure,
+        guard, q->chat, w, res, api::responses_failure,
         [&, q, w, keep](const ChatResult& out) {
           if (out.finish_reason != "error") keep(w->output());
           prefill_after(q->chat, out);
@@ -1078,20 +1189,21 @@ static int serve(int argc, char** argv, int first) {
       "http://" + (shown.find(':') != std::string::npos ? "[" + shown + "]" : shown) + ":" + std::to_string(port);
   if (tui) {
     ui::Ready card;
-    card.model = engine.model_id();
-    if (ref.variant) card.quant = ref.variant->quant;
+    card.model = model_mgr->current_model_id();
+    auto cur_ref = model_mgr->current_ref();
+    if (cur_ref.variant) card.quant = cur_ref.variant->quant;
     card.base = base;
     card.api_key_note = api_key.empty() ? "" : "required (--api-key)";
     card.log = log_path;
     card.budget = budget;
     card.used = Gpu::get().allocated_bytes();
-    card.context = engine.context_length();
-    card.context_fit = engine.context_fit();
-    card.slots = engine.slots();  // as the engine started (auto_slots when --slots is not given)
+    card.context = model_mgr->current_context_length();
+    card.context_fit = model_mgr->current_context_fit();
+    card.slots = model_mgr->current_slots();  // as the engine started (auto_slots when --slots is not given)
     ui::ready(card);
   } else {
     printf("Ready: chat at %s, API at %s/v1 (model \"%s\"%s). Ctrl+C stops.\n", base.c_str(), base.c_str(),
-           engine.model_id().c_str(), api_key.empty() ? "" : ", API key required");
+           model_mgr->current_model_id().c_str(), api_key.empty() ? "" : ", API key required");
   }
   fflush(stdout);
   srv.listen_after_bind();
