@@ -210,15 +210,23 @@ takes the 27B's verify cycle on a coding answer from 16.70 ms at 8 rows to 17.92
 against 1.55× and ~2.7× before it (the author's cycle timings on an M5-class Mac, not re-run by the reviewers).
 
 What is checked: `kflash_wide_check` (a wide verify against plain decoding on random trees of 9 to 32 live rows) passes on
-the 4B and the 27B, with every live row's argmax equal to plain decoding's and a max logit difference of 0.008 (0.0003 of a
-row's range) on an M5 Pro; the default path (8 rows) is bitwise identical to main on the 4B (`logit_compare`). What is not
-checked: a whole-reply comparison of a wide run, and the throughput gain. Earlier runs on the harness corpus showed more
-tokens per cycle with the wider tiles, but the 27B's decode over repetitions at T=0.6 spread by 5 to 6 tok/s, so no tok/s
-gain over the 8-row default or against mlx-serve is claimed here; that needs a paired A/B.
+the 4B and the 27B, with every live row's argmax equal to plain decoding's and max logit differences of 0.019 on the 4B and
+0.274 on the 27B's 32-row chain trees (0.0005 and 0.0095 of a row's range) on an M5 Pro; the default path (8 rows) is bitwise identical to main on the 4B (`logit_compare`). What is not
+checked: a whole-reply comparison of a wide run over a corpus, and its effect on the other engines' comparison.
+
+A paired A/B on the 27B over a 256-token coding prompt (greedy, three interleaved runs each, `NI_ANE=0`, all under the GPU
+lock: MacBook Pro Mac17,8, Apple M5 Pro, macOS 26.5.2, the code of #245 and #246 at `ac82451`) measures it: the default 8-row pass runs
+70.6/70.5/68.8 tok/s at 4.76 tokens per cycle with verify cycles of 68.7-69.7 ms, and `NI_KFLASH_ROWS=8,16,32` runs
+69.3/74.7/72.9 tok/s at 5.20/5.44/5.33 tokens per cycle, its 16-row verify cycles costing 74.4 ms and 32-row ones 115.4
+(median 72.9 vs 70.5 tok/s, +3% at +12% tokens per cycle; n=3 and the ranges overlap, 68.8-70.6 against 69.3-74.7, so the gain is
+suggestive, not settled; the wide runs' own 8-row cycles cost 73.3-73.6 ms against the default's 68.7-69.7, a ~5% overhead the
+gain has to clear; one run also paid to measure 32-row verifies, which do not pay). All six runs generated the same greedy
+ids as plain decoding. Separately, on the 4B, `logit_compare` of `logit_dump` from `main` and from `ac82451` (default 8 rows)
+found every row bitwise identical; that was not repeated on the 27B.
 
 So the tiles are opt-in: one tile is the setting the default's cost table is tuned for, and a Mac where the budget's
-measurements say a wider verify pays (the 27B and the 4B at 4-bit do, on prose and coding answers) can have it without
-paying the narrow cost elsewhere. With bf16 weights the verify is bound by memory instead: 16 rows cost 1.05× an 8-row
+cost table says a wider verify pays can have it without paying the narrow cost elsewhere. The cycle-time ratios are
+measured; the 27B's tok/s gain is within noise (the A/B above), so it is not claimed. With bf16 weights the verify is bound by memory instead: 16 rows cost 1.05× an 8-row
 verify, and the 4B ran 11-16% faster with the sizes forced.
 
 ### The drafters as published
