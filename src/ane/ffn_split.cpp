@@ -121,6 +121,11 @@ FfnSplit::FfnSplit(const FfnConfig& c, std::vector<FfnLayer> layers) : layers_(s
     throw;
   }
   startup_ms_ = now_ms() - t0;
+  // NI_ANE_KEEP_S (default 300): see keep_loop. 0 turns the keepalive off; NI_ANE_KEEP_MS sets its period.
+  keep_window_s_ = getenv("NI_ANE_KEEP_S") ? atof(getenv("NI_ANE_KEEP_S")) : 300;
+  if (getenv("NI_ANE_KEEP_MS")) keep_period_ms_ = std::max(100.0, atof(getenv("NI_ANE_KEEP_MS")));
+  last_use_ = now_ms();
+  if (keep_window_s_ > 0) keep_ = std::thread([this, st = keep_st_, prog = prog_.get(), b = bind_[0][0][0]] { keep_loop(st, prog, b); });
 }
 
 void FfnSplit::init_resources() {
@@ -231,7 +236,53 @@ void FfnSplit::init_resources() {
   (void)prog_ms;
 }
 
-FfnSplit::~FfnSplit() { free_all(); }
+FfnSplit::~FfnSplit() {
+  {
+    std::lock_guard lk(keep_st_->m);
+    keep_st_->stop = true;
+  }
+  keep_st_->cv.notify_all();
+  if (keep_.joinable()) {
+    // Program::evaluate has no timeout. If the keepalive is wedged in it, do not hang the process on exit or model
+    // unload: detach the thread and leak what its evaluation uses rather than free it underneath.
+    const double t0 = now_ms();
+    while (!keep_st_->done && now_ms() - t0 < 2000) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if (keep_st_->done) {
+      keep_.join();
+    } else {
+      fprintf(stderr, "ANE split: the keepalive evaluation did not return; leaking the program and its surfaces\n");
+      keep_.detach();
+      (void)prog_.release();
+      for (auto& b : bind_)
+        for (auto& l : b) (void)new std::vector<std::shared_ptr<Program::Binding>>(std::move(l));
+      (void)h_.release();
+      return;
+    }
+  }
+  free_all();
+}
+
+void FfnSplit::keep_loop(std::shared_ptr<KeepState> st, Program* prog, std::shared_ptr<Program::Binding> bind) {
+  // After the evaluation returns, only `st` is touched before the stop check: the FfnSplit may be gone by then.
+  const double period_ms = keep_period_ms_, window_ms = keep_window_s_ * 1000;
+  for (;;) {
+    {
+      std::unique_lock lk(st->m);
+      st->cv.wait_for(lk, std::chrono::duration<double, std::milli>(period_ms), [&] { return st->stop; });
+      if (st->stop) break;
+    }
+    if (h_->retired()) break;  // the Neural Engine misbehaved: leave it alone
+    std::lock_guard ev(st->eval_mu);  // begin_chunk sets in_chunk_ and then takes this lock: check after taking it
+    if (in_chunk_ || fn_ >= 0) continue;
+    const double idle_ms = now_ms() - last_use_;
+    if (idle_ms < period_ms || idle_ms > window_ms) continue;  // between chunks of a request, or asleep for good
+    try {
+      prog->evaluate(*bind);
+    } catch (...) {
+    }
+  }
+  st->done = true;
+}
 
 uint32_t FfnSplit::rotate_simdgroups(uint32_t hidden) {
   if (hidden % kSeg) return 0;
@@ -481,7 +532,20 @@ int FfnSplit::fn_for(int T) const {
 
 void FfnSplit::begin_chunk(int T) {
   if (T < 1 || T > int(kMaxRows)) throw std::logic_error("ANE split: chunk rows out of range");
+  in_chunk_ = true;
+  struct Reset {  // a chunk that never starts must not leave the keepalive stopped
+    std::atomic<bool>& f;
+    bool armed = true;
+    ~Reset() { if (armed) f = false; }
+  } reset{in_chunk_};
+  {
+    // Waits out a keepalive evaluation in flight (about 8 ms). Program::evaluate has no timeout, so the wait is bounded:
+    // if the Neural Engine is wedged in it, retire the split and the chunk falls back to the GPU alone.
+    std::unique_lock lk(keep_st_->eval_mu, std::defer_lock);
+    if (!lk.try_lock_for(std::chrono::seconds(2))) h_->retire("the keepalive evaluation did not return");
+  }
   fn_ = fn_for(T);
+  reset.armed = false;
   T_ = T;
   jobs_ = 0;
   lane_[0].done = lane_[1].done = 0;
@@ -593,6 +657,8 @@ bool FfnSplit::finish_chunk(double* ane_ms) {
   }
   if (ane_ms) *ane_ms = ms;
   fn_ = -1;
+  last_use_ = now_ms();
+  in_chunk_ = false;
   last_jobs_ = jobs_;
   if (jobs_ && wired_run_ == 0) wired_run_ = wired_mb() - wired0_;
   return ok;

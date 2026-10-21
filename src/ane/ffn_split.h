@@ -16,9 +16,13 @@
 #include "ane/ane.h"
 #include "metal/gpu.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace ni::ane {
@@ -131,6 +135,24 @@ class FfnSplit {
   std::unique_ptr<Handoff> h_;
   FfnConfig cfg_;
   int fn_ = -1, T_ = 0, jobs_ = 0, last_jobs_ = 0;
+  // Keepalive: the Neural Engine sleeps after about a second idle and its first evaluation then blocks for
+  // 70-120 ms. For keep_window_s_ seconds after the last chunk a side thread runs one 512-row evaluation every
+  // keep_period_ms_ (about 7 ms of ANE time, ~0.4% duty; nothing after the window), so a request after a pause finds it awake. Zero window: off.
+  // The thread's state is shared with it, so a thread wedged in a Neural Engine evaluation can be detached (and
+  // what it uses leaked) by the destructor instead of hanging it.
+  struct KeepState {
+    std::mutex m;  // stop / cv
+    std::condition_variable cv;
+    bool stop = false;
+    std::atomic<bool> done{false};
+    std::timed_mutex eval_mu;  // held by the keepalive evaluation (it uses lane 0 / set 0) and briefly by begin_chunk
+  };
+  void keep_loop(std::shared_ptr<KeepState> st, Program* prog, std::shared_ptr<Program::Binding> bind);
+  double keep_window_s_ = 0, keep_period_ms_ = 2000;
+  std::thread keep_;
+  std::shared_ptr<KeepState> keep_st_ = std::make_shared<KeepState>();
+  std::atomic<bool> in_chunk_{false};
+  std::atomic<double> last_use_{0};
   double wired0_ = 0, wired_load_ = 0, wired_run_ = 0;
   bool fault_used_ = false;
   size_t bytes_ = 0;
