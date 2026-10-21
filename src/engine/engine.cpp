@@ -544,6 +544,15 @@ int auto_prefill_chunk(const std::string& model_dir, int context, int slots, siz
     }
   const MemPlan p = model_plan(model_dir, 2048);
   const size_t ane = model_ane_bytes(model_dir, p);
+  // Single-stream 35B-A3B 4-bit on the 32-core M1 Max: larger prompt chunks
+  // reduce expert-tile padding and weight rereads. Keep the existing chunk for
+  // concurrent slots, other formats/devices, or when the extra buffers do not fit.
+  if (slots == 1 && !p.dense && p.hidden == 2048 && p.layers == 40 &&
+      p.formats.rfind("4-bit group 64", 0) == 0 && Gpu::get().name() == "Apple M1 Max" &&
+      Gpu::get().core_count() == 32) {
+    const MemPlan wide = model_plan(model_dir, 4096);
+    if (wide.fixed(1) + model_ane_bytes(model_dir, wide) + wide.kv_per_pos * size_t(context) <= budget) return 4096;
+  }
   return p.fixed(std::max(1, slots)) + ane + p.kv_per_pos * size_t(context) <= budget ? 2048 : 1024;
 }
 
