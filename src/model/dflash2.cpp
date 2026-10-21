@@ -26,6 +26,11 @@ namespace ni {
 extern const char* const kTensorKernelSource;
 using json = nlohmann::json;
 
+static bool default_v8(size_t hidden, bool moe, bool head_q4) {
+  static const bool m1_max32 = Gpu::get().name() == "Apple M1 Max" && Gpu::get().core_count() == 32;
+  return hidden >= 2560 || (m1_max32 && hidden == 2048 && moe && head_q4);
+}
+
 // process physical footprint (what Activity Monitor / bench.py report), bytes
 static double footprint_gb() {
   task_vm_info_data_t info;
@@ -558,9 +563,9 @@ void DFlash2::alloc_buffers() {
   {
     // the target's 8-row verify GEMMs for the drafter's projections (NI_DFLASH_V8=0/1 overrides): the 27B's drafter
     // (H 5120) and the 4B's (H 2560: 4-bit 4B, code / prose, 178.2 -> 179.8 / 142.1 -> 144.2 tok/s); the 35B's
-    // (H 2048) keeps dfl_qmm8
+    // (H 2048) keeps dfl_qmm8 except for the measured 32-core M1 Max 4-bit MoE case
     const char* v = getenv("NI_DFLASH_V8");
-    v8_ = v && *v ? atoi(v) != 0 : H >= 2560;
+    v8_ = v && *v ? atoi(v) != 0 : default_v8(H, tg_.config().moe, tg_.lm_head().q4());
   }
   if (v8_) {
     v8t_ = g.alloc(8 * H * 2, "dfl_v8_table");
@@ -767,7 +772,10 @@ size_t DFlash2::plan_bytes(const std::string& dir, const Qwen35Config& target, s
              8 * 2048 * 4 + 32 * 8 * 128 * 4 + 2 * 8 * 8 * 128 * 4 + 32 * (32 * 8 * 128 * 4 + 32 * 8 * 2 * 4) + 8 * V * 4 + 8 * kRank * 4 +
              2 * 7 * ntg * 16 * 4 + 8 * nH * 2 + 8 * KV * 4 + size_t(kCtxKeep) * H * 4 + (64 << 10);
   const char* v8 = getenv("NI_DFLASH_V8");
-  if (v8 && *v8 ? atoi(v8) != 0 : H >= 2560) b += 8 * H * 2 + 8 * I * 2 + I / 64 * 8 * 4;
+  // A native 4-bit group-64 head row includes its packed codes, scales and biases.
+  const bool head_q4 = head_row_bytes == size_t(target.hidden) / 2 + size_t(target.hidden) / 64 * 4;
+  if (v8 && *v8 ? atoi(v8) != 0 : default_v8(H, target.moe, head_q4))
+    b += 8 * H * 2 + 8 * I * 2 + I / 64 * 8 * 4;
   // build_head(): rows of the target's LM head (the ranked or id-order rows plus every id from the first
   // end-of-sequence id on)
   {
