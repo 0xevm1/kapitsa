@@ -2,6 +2,12 @@
 
 Measured on 2026-10-17 (Qwen3.6 and Qwen3.8-27B) and 2026-10-18 (Nemotron 3.5 Super-VL and Lightning, Qwen3.8-Flash-Next) with the stock benchmark harness. **Every run passed correctness checks but was flagged for background GPU contention.** These are measurements with desktop applications open, not an idle-machine comparison or a maximum-performance claim. Super-VL, a 96 GB+ model, Lightning and Flash-Next, a 128 GB model, were also measured against every other engine that runs them on a Mac ([Super-VL](#nemotron-35-super-vl-against-the-other-engines), [Lightning](#nemotron-35-lightning-against-the-other-engines), [Flash-Next](#qwen38-flash-next-against-the-other-engines)).
 
+These numbers come from builds before the M5 prefill kernels ([#205](https://github.com/nace-ai/kapitsa/pull/205),
+[#215](https://github.com/nace-ai/kapitsa/pull/215)) and before [#187](https://github.com/nace-ai/kapitsa/pull/187) made
+KFlash the decode default, so the prefill cells here are lower bounds for current main (on the M5 Pro the same two changes
+moved 4K prefill by 1.15x to 3.07x within a day), and the decode cells predate the KFlash trees. No M5 Max was available
+to re-measure: the numbers stay as measured, and are read as the 0.1.36 record rather than as current main.
+
 ## Results
 
 | Metric | Qwen3.6-35B-A3B | Qwen3.8-27B | Nemotron 3.5 Super-VL 120B-A12B | Nemotron 3.5 Lightning 30B-A3B | Qwen3.8-Flash-Next 180B-A7B |

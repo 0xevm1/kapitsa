@@ -375,6 +375,19 @@ def port_of(c):
     u = urllib.parse.urlparse(c.get("base_url") or "")
     return c.get("port") or u.port
 
+def live_slots(cmd):
+    """Conversations the server argv keeps resident at once: --slots N (Kapitsa, MLX) or -np / --parallel /
+    --max-concurrency N (llama.cpp). 0 = not passed, i.e. whatever the engine's own default is."""
+    names = ("--slots", "-np", "--parallel", "--max-concurrency")
+    cmd = list(cmd or [])
+    for i, tok in enumerate(cmd):
+        for n in names:
+            if tok == n and i + 1 < len(cmd) and str(cmd[i + 1]).isdigit():
+                return int(cmd[i + 1])
+            if tok.startswith(n + "=") and tok.split("=", 1)[1].isdigit():
+                return int(tok.split("=", 1)[1])
+    return 0
+
 
 def port_open(port, host="127.0.0.1"):
     try:
@@ -933,6 +946,8 @@ def plan(c, args, stamp):
         model_id = c.get("model", "")
     bargs = ["--base-url", c.get("base_url", ""), "--model", model_id, "--label", c["label"],
              "--sizes", args.sizes, "--out", p["out"], "--warmup", "none"]
+    p["server_slots"] = live_slots(p.get("cmd"))
+    bargs += ["--server-slots", str(p["server_slots"])]
     if c.get("no_think_style"):
         bargs += ["--no-think-style", c["no_think_style"]]
     if c.get("sampling_overrides"):

@@ -1441,6 +1441,15 @@ other engine on each model again. The tables show each engine's fastest setting,
 does. The Mac held about 6 GB in swap throughout. Result files, every run listed with its flags:
 [bench/results/2026-10-19-m5pro-48gb](../bench/results/2026-10-19-m5pro-48gb/).
 
+Each Kapitsa table below also carries a paragraph with that model's newest flag-free run on 0.2.2, which is after the
+M5 prefill kernels and the KFlash-tree default; the other engines' rows are the 2026-10-19 session in every table.
+Current main also peaks 0.3-0.8 GB above these rows on all four models (4.7 → 5.4 GB, 19.4 → 20.2, 20.8 → 21.4,
+18.6 → 18.9 GB). The SSD prefix cache is new since 0.1.36 and on by default in `serve`. On the 4B it accounts for
+about 0.33 GB of the roughly 0.7 GB growth: a 16K prefill peaks at 5,204 MB with it (two runs, 5,203.6 and 5,204.1) and
+4,868 MB with `NI_DISK_CACHE=0` (these peak readings are not stored in the repo). That is a 16K-prefill figure, not the peak of the whole agentic run the table
+reports, and the other three models were not split. The doctor's memory plan is identical at 0.1.36 and current main,
+so none of the growth is weights or KV; the rest is runtime state the plan does not cover and is not attributed yet.
+
 ### Qwen3.5-4B at 4-bit
 
 | Engine (setting) | Decode, T = 0.6 (tok/s) | Decode, greedy (tok/s) | Prefill 4K / 16K (tok/s) | Cached follow-up 4K / 16K (s) | Peak memory (GB) | Tool calls |
@@ -1477,6 +1486,17 @@ Power mode, [`q35-4b-kapitsa-20261021-235433.json`](../bench/results/2026-10-21-
 | llama.cpp b11669 (MTP, n-max 3; Q4_K_M) | 29.6 (27.5-31.8) | 30.7 (29.2-31.2)<sup>3</sup> | 322<sup>3</sup> / 312 | 0.52 / 0.54 | 31.8 | pass |
 | LM Studio (MLX runtime 1.13.1) | 16.8 (16.7-17.4) | 16.9 (16.4-17.4) | 118 / 129 | 0.52 / 0.62 | 23.1 | pass |
 
+Kapitsa's row above is the 2026-10-19 session, and that build predates the M5 prefill kernels
+([#205](https://github.com/nace-ai/kapitsa/pull/205), [#215](https://github.com/nace-ai/kapitsa/pull/215)) and the
+KFlash-tree decode default ([#187](https://github.com/nace-ai/kapitsa/pull/187)). On 0.2.2 (`a13f8fd`) the 27B reads
+**463 / 451 tok/s** at 4K / 16K and decodes **74.1 / 77.4 tok/s** (T = 0.6 / greedy), with cached follow-ups at
+0.21 / 0.23 s and a peak footprint of 20.2 GB: flag-free, on AC power in High Power mode, in two runs that agree to
+0.4% (465 / 451 at 19:57, 2.4 h before),
+[`q38-27b-kapitsa-20261021-221847.json`](../bench/results/2026-10-21-m5pro-48gb/README.md).
+Read as stored beside the 10-19 rows: Kapitsa's sampled decode is the table's fastest (74.1 against mlx-serve's 71.2,
+1.04x), mlx-serve keeps greedy (85.6, 1.11x) and both prefill cells (496 / 476 against 463 / 451, 1.07x / 1.06x), and
+Kapitsa reads the prompt fourth of nine at both sizes.
+
 ### Qwen3.6-35B-A3B at 4-bit
 
 | Engine (setting) | Decode, T = 0.6 (tok/s) | Decode, greedy (tok/s) | Prefill 4K / 16K (tok/s) | Cached follow-up 4K / 16K (s) | Peak memory (GB) | Tool calls |
@@ -1491,11 +1511,26 @@ Power mode, [`q35-4b-kapitsa-20261021-235433.json`](../bench/results/2026-10-21-
 | MTPLX 2.12.2 (depth 1) | 88.6 (87.0-91.7) | 83.8 (79.1-85.4) | **2,569** / 2,303 | 0.08 / 0.11 | 28.6 | pass |
 | Rapid-MLX 0.16.3 (no speculation)<sup>8</sup> | 75.7 (74.1-76.0) | 77.6 (77.0-77.8) | 1,826 / 1,703 | 0.22 / 0.31 | 23.8 | pass |
 
-Kapitsa decodes fastest on the 4B and the 35B (1.10x and 1.07x mlx-serve at T = 0.6, 1.21x and 1.19x greedy) and
-answers cached follow-ups soonest on both (0.05 / 0.06 s; next MTPLX, 0.06 / 0.08 s on the 4B and 0.08 / 0.11 s on
-the 35B). mlx-serve's DFlash2 draft tree decodes the 27B 1.17x faster than Kapitsa (1.32x greedy). Kapitsa reads
-prompts more slowly than most: at 4K mlx-serve reads 1.30x its rate on the 4B, 1.23x on the 27B and 1.98x on the 35B;
-only LM Studio and llama.cpp are slower on the 4B and 27B, and LM Studio on the 35B.
+Kapitsa's row above is the 2026-10-19 session, before the M5 prefill kernels ([#205](https://github.com/nace-ai/kapitsa/pull/205),
+[#215](https://github.com/nace-ai/kapitsa/pull/215)) and the KFlash-tree decode default ([#187](https://github.com/nace-ai/kapitsa/pull/187)).
+On 0.2.2 (`a13f8fd`) the 35B reads **1,799 / 1,455 tok/s** at 4K / 16K and decodes **195.1 / 223.4 tok/s** (T = 0.6 / greedy),
+1.25x / 1.40x mlx-serve, with cached follow-ups at 0.05 / 0.07 s (the table's fastest) and a peak footprint of 21.4 GB:
+flag-free, on AC power in High Power mode, and 1.4% behind the first set that evening (20:06, 1,824 / 1,469),
+[`q36-35b-kapitsa-20261021-220021.json`](../bench/results/2026-10-21-m5pro-48gb/README.md). Read as stored it is fifth of
+nine on prefill at 4K (MTPLX 2,569, mlx-serve 2,494 and mlx-vlm 2,474 lead) and seventh at 16K (mlx-vlm 2,401,
+MTPLX 2,303, mlx-serve 2,283 lead).
+
+On 0.2.2 (`a13f8fd`, `3a5bbf0`) Kapitsa decodes fastest in four of the tables above: 226.7, 74.1,
+195.1 and 159.3 tok/s at T = 0.6 on the 4B, the 27B, the 35B and Lightning, 1.39x, 1.04x, 1.25x and 1.29x the next
+engine, and 1.44x, 1.40x and 1.37x greedy on the 4B, 35B and Lightning (mlx-serve's block-8 DFlash2 draft tree keeps
+the 27B's greedy cell, 85.6 against 77.4, 1.11x). It answers cached follow-ups soonest on the 4B and the 35B
+(0.05 / 0.06 s and 0.05 / 0.07 s; next MTPLX, 0.06 / 0.08 s and 0.08 / 0.11 s). It reads prompts fastest on the 4B at
+4K (3,269 against oMLX's 2,842) and on Lightning at both sizes, and second on the 4B at 16K (2,735 against mlx-vlm's
+2,755, 0.7%). It is fourth of nine on the 27B at both sizes, behind mlx-serve (496 / 476), MTPLX (471) and Ollama (470)
+at 4K and mlx-serve, Rapid-MLX (457) and Ollama (456) at 16K; on the 35B it is fifth at 4K behind MTPLX, mlx-serve,
+mlx-vlm and Rapid-MLX, and seventh at 16K. The pre-kernel Kapitsa rows in
+these tables understate current main by 1.15x to 3.07x on prefill, and the other engines' rows are still the
+2026-10-19 session, so every column is read as stored rather than as one side-by-side run.
 
 1. Kapitsa's first 4B run, at 10:13: 189.3 tok/s at T = 0.6 (191.9 greedy). The Mac swapped 23,955 pages during the
    closing run's 16K prefill.
@@ -1524,6 +1559,14 @@ only LM Studio and llama.cpp are slower on the 4B and 27B, and LM Studio on the 
 | Ollama 0.40.6 (MLX runner, NVFP4 tag + MTP) | 91.5 (82.1-96.3) | 88.8 (87.4-98.4) | **2,369** / **2,310** | 0.17 / 0.21 | 35.8 | pass |
 | LM Studio (llama.cpp runtime; Q4_K_M) | 72.3 (72.0-72.5) | 72.2 (71.7-72.5) | 1,479 / 1,443 | 0.18 / 0.16 | 4.7 + 22.9 mapped<sup>4</sup> | pass |
 
+Kapitsa's row above is the 2026-10-19 session, before the M5 prefill kernels ([#205](https://github.com/nace-ai/kapitsa/pull/205),
+[#215](https://github.com/nace-ai/kapitsa/pull/215)) and the KFlash-tree decode default ([#187](https://github.com/nace-ai/kapitsa/pull/187)).
+On 0.2.2 (`a13f8fd`) Lightning reads **3,141 / 2,982 tok/s** at 4K / 16K, fastest in the table at both sizes (1.33x / 1.29x
+Ollama's 2,369 / 2,310), and decodes **159.3 / 170.8 tok/s** (1.29x / 1.37x oMLX's 123.6 / 124.4), with cached follow-ups at
+0.09 / 0.10 s (level with mlx-serve and MTPLX) and a peak footprint of 18.9 GB: flag-free, on AC power in High Power mode,
+and 3.1% ahead of the first set that evening (20:02, 3,048 / 2,989),
+[`lightning-kapitsa-20261021-221051.json`](../bench/results/2026-10-21-m5pro-48gb/README.md).
+
 ### Nemotron 3.5 Bolt 74B-A9B
 
 | Engine (setting) | Decode, T = 0.6 (tok/s) | Decode, greedy (tok/s) | Prefill 4K / 16K (tok/s) | Cached follow-up 4K / 16K (s) | Peak memory (GB) | Tool calls |
@@ -1534,6 +1577,13 @@ only LM Studio and llama.cpp are slower on the 4B and 27B, and LM Studio on the 
 
 oMLX's LiLiCorr drafter was not run: Bolt's files had left the disk before its greedy-only run came up (the drafter
 fails at T = 0.6, as on the M5 Max).
+
+Kapitsa's Bolt cells are the 0.1.36 build too, and unlike the four models above they could not be re-measured: Bolt's
+files had left the disk before the M5 prefill kernels ([#205](https://github.com/nace-ai/kapitsa/pull/205),
+[#215](https://github.com/nace-ai/kapitsa/pull/215)) and the KFlash-tree default ([#187](https://github.com/nace-ai/kapitsa/pull/187))
+landed, and they were not downloaded again (this Mac has no Bolt checkpoint). Both its prefill and its decode cells are
+therefore lower bounds for current main; on the models that were re-measured those two changes moved 4K prefill by
+1.15x to 3.07x (see the four paragraphs above).
 
 ### Nemotron Dory1.0 4B
 

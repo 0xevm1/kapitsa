@@ -235,7 +235,9 @@ def t_cache(a, log=print):
     sid = {k: f"bench-{k}-{random.getrandbits(40):010x}" for k in "ab"}
     sysmsg = {"a": f"[session {random.getrandbits(64):016x}] {bench.SYS}\n\n# Repository context\n{ctx_a}",
               "b": f"[session {random.getrandbits(64):016x}] {bench.SYS}\n\n# Repository context\n{ctx_b}"}
-    res, invalid, flags = {"target": tg, "turns": []}, [], []
+    res, invalid, flags = {"target": tg, "turns": [],
+                           "server_slots": getattr(a, "server_slots", 0) or 0}, [], []
+    slots = res["server_slots"]  # conversations the server keeps live at once: the A-after-B turn depends on it
 
     def ask(who, i, label, history=None):
         msgs = [{"role": "system", "content": sysmsg[who]}, {"role": "user", "content": SHORT_Q[i % len(SHORT_Q)]}]
@@ -273,7 +275,8 @@ def t_cache(a, log=print):
             warm.append(w)
     ask("b", 0, "B cold")
     time.sleep(a.turn_gap)
-    back = ask("a", 4, "A after B")
+    # The label says how many conversations the server keeps: with one slot B evicts A, with several A's prefix survives
+    back = ask("a", 4, f"A after B (slots {slots})" if slots else "A after B")
     if cold:
         res["cold_ttft_s"] = cold["ttft_s"]
         res["cold_cached_tokens"] = cold["cached_tokens"]
@@ -292,6 +295,11 @@ def t_cache(a, log=print):
     if back:
         res["interleave_ttft_s"] = back["ttft_s"]
         res["interleave_cached_tokens"] = back["cached_tokens"]
+        if slots == 1 and not (back["cached_tokens"] or 0):
+            res["interleave_note"] = (
+                "A re-prefilled: --slots 1 keeps one conversation live, so B evicted A. The engine's own default "
+                "(Kapitsa 4) keeps several; the *-4slots config measures that, and there A hits its prefix")
+            flags.append(f"cache: A after B re-prefilled with --slots {slots} (one live conversation, not a prefix loss)")
     for t in res["turns"]:
         t.pop("answer", None)
     res.update(summarize_cache(res))

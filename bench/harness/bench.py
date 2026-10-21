@@ -752,6 +752,9 @@ def parse_args(argv=None):
     ap.add_argument("--sweep-repeats", type=int, default=2, help="agentic sweep: cold requests per size (median)")
     ap.add_argument("--max-ctx", type=int, default=32768, help="context the server runs with (agentic sweep 'max' fits it)")
     ap.add_argument("--cache-tokens", type=int, default=8000, help="agentic cache phase: shared prefix size")
+    ap.add_argument("--server-slots", type=int, default=0,
+                    help="conversations the server keeps live at once (its --slots); 0 = the engine's own default. "
+                         "Stamped into the cache phase, whose A-after-B turn depends on it")
     ap.add_argument("--sustain-s", type=float, default=300, help="agentic sustain phase: seconds of back-to-back decodes")
     ap.add_argument("--agent-trace", default=None,
                     help="agent session to replay (default agent-traces/opencode-ledger.json; 'none' = no agent phase)")

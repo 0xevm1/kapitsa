@@ -11,7 +11,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HARNESS = os.path.join(HERE, "..", "bench", "harness")
 sys.path.insert(0, HARNESS)
 os.environ["BENCH_GPU_LOCK"] = os.path.join(os.environ.get("TMPDIR", "/tmp"), "test-agentic-gpu.lock")
-import agentic, bench, compare_table  # noqa: E402
+import agentic, bench, compare_engines, compare_table  # noqa: E402
 
 FAILED = []
 
@@ -119,6 +119,30 @@ check(ca1["interleave_prefix_kept"] is False and ca1["interleave_cached_tokens"]
 check(not ca1["invalid"], "cache valid on a clean server")
 Fake.cache_sessions = 8
 
+# ---- the slot count is recorded, labelled and flagged: --slots 1 evicts A, four keep it
+a.server_slots = 1
+Fake.last.clear()
+Fake.cache_sessions = 1
+ca1s = agentic.t_cache(a, log=lambda m: None)
+check(ca1s["server_slots"] == 1, "cache records the server's slot count", str(ca1s.get("server_slots")))
+check(any(t["label"] == "A after B (slots 1)" for t in ca1s["turns"]), "the A-after-B turn is labelled with the slots",
+      str([t["label"] for t in ca1s["turns"]]))
+check(bool(ca1s.get("interleave_note")) and any("--slots 1" in f for f in ca1s["flags"]),
+      "one slot is flagged as the configuration, not as a lost prefix", str(ca1s["flags"]))
+a.server_slots = 4
+Fake.last.clear()
+Fake.cache_sessions = 4
+ca4 = agentic.t_cache(a, log=lambda m: None)
+check(ca4["server_slots"] == 4 and ca4["interleave_prefix_kept"] is True
+      and not ca4.get("interleave_note") and not [f for f in ca4["flags"] if f.startswith("cache:")],
+      "four slots keep A and flag nothing", str(ca4["flags"]))
+a.server_slots = 0
+Fake.cache_sessions = 1
+ca0 = agentic.t_cache(a, log=lambda m: None)
+check(ca0["server_slots"] == 0 and not [f for f in ca0["flags"] if f.startswith("cache:")],
+      "an unknown slot count is recorded as 0 and not flagged", str(ca0["flags"]))
+Fake.cache_sessions = 8
+
 su = agentic.t_sustain(a, log=lambda m: None)
 check(su["valid_runs"] >= 2 and su["duration_s"] >= 0 and "thermal_start" in su, "sustain runs until the time is up", str(su)[:200])
 
@@ -146,6 +170,21 @@ check(row and row["ttft_16k"] == 6.0 and row["dec_max"] == 60.0 and row["max_tok
 md = compare_table.agentic_table("Qwen3.5-4B", [row])
 check("agent-harness metrics" in md and "82%" in md and "no (0.90x cold)" in md, "agentic table renders", md[-400:])
 check(compare_table.extract_agentic({"label": "q", "schema": 2}, "y.json", base) is None, "results without --agentic add no row")
+for slots, want, unwanted in ((1, "slots 1", "engine default"), (4, "slots 4", "engine default"), (0, "engine default", "slots 1")):
+    ds = json.loads(json.dumps(d))
+    ds["cache"]["server_slots"] = slots
+    mds = compare_table.agentic_table("Qwen3.5-4B", [compare_table.extract_agentic(ds, "x.json", base)])
+    check(want in mds and unwanted not in mds, f"agentic table shows slots {slots}", mds[-500:])
+
+# ---- which live conversation count an engine command asks for
+check(compare_engines.live_slots(["kapitsa", "serve", "--slots", "4"]) == 4, "live_slots reads --slots N")
+check(compare_engines.live_slots(["serve", "--slots=2"]) == 2, "live_slots reads --slots=N")
+check(compare_engines.live_slots(["llama-server", "-np", "3"]) == 3, "live_slots reads -np N")
+check(compare_engines.live_slots(["s", "--parallel", "8"]) == 8, "live_slots reads --parallel N")
+check(compare_engines.live_slots(["s", "--max-concurrency=6"]) == 6, "live_slots reads --max-concurrency=N")
+check(compare_engines.live_slots(["s", "--slots"]) == 0 and compare_engines.live_slots(["s", "--slots", "auto"]) == 0
+      and compare_engines.live_slots([]) == 0 and compare_engines.live_slots(None) == 0,
+      "live_slots is 0 when the command leaves it to the engine")
 
 srv.shutdown()
 print("FAILED: " + ", ".join(FAILED) if FAILED else "all passed")

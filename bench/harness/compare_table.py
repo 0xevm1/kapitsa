@@ -222,6 +222,7 @@ def extract_agentic(d, path, base):
               "followup_hit_rate": (ca or {}).get("followup_hit_rate"),
               "warm_speedup": (ca or {}).get("warm_vs_cold_speedup"),
               "kept": (ca or {}).get("interleave_prefix_kept"), "interleave": (ca or {}).get("interleave_vs_cold"),
+              "slots": (ca or {}).get("server_slots"),
               "hit_rate": hit, "warm_hit_rate": (ca or {}).get("warm_hit_rate"),
               "falloff": (su or {}).get("thermal_falloff_pct"), "sustain_s": (su or {}).get("duration_s"),
               "idle_mb": idle, "peak_mb": peak,
@@ -255,7 +256,8 @@ def agentic_table(model, rows):
         best[key] = (max(vals) if how == "max" else min(vals)) if vals else None
     hw = collections.Counter(r["hardware"] for r in rows if r.get("hardware")).most_common(1)
     lines = [f"\n### {model}: agent-harness metrics" + (f" ({hw[0][0]})" if hw else "") + "\n",
-             "| engine | " + " | ".join(h for _, h, _, _ in AGENTIC_COLS) + " | prefix kept after other chat | idle / peak GB | flags |",
+             "| engine | " + " | ".join(h for _, h, _, _ in AGENTIC_COLS)
+             + " | prefix kept after other chat (live conversations) | idle / peak GB | flags |",
              "|---|" + "---|" * (len(AGENTIC_COLS) + 3)]
     for r in rows:
         name = r["display"] + (" (ours)" if r["ours"] and "ours" not in r["display"] else "")
@@ -271,6 +273,8 @@ def agentic_table(model, rows):
         kept = "-" if r.get("kept") is None else ("yes" if r["kept"] else "no")
         if r.get("interleave") is not None:
             kept += f" ({r['interleave']:.2f}x cold)"
+        live = r.get("slots")
+        kept += " · slots " + (str(live) if live else "engine default")
         mem = "-" if not r.get("peak_mb") else (f"{(r.get('idle_mb') or 0) / 1024:.1f} / {r['peak_mb'] / 1024:.1f}")
         lines.append(f"| {name} | " + " | ".join(cells) + f" | {kept} | {mem} | {short_flags(r)} |")
     lines.append("")
@@ -278,12 +282,15 @@ def agentic_table(model, rows):
     lines.append("")
     lines.append("`-` = not measured or not reported by the engine (a hit rate of 0% means it reported 0 cached tokens). "
                  "Max = the largest context that fits the server's window (`max tokens` in the CSV). Retention = decode at "
-                 "the largest context over the smallest. Falloff = decode of the last third of the sustain run vs the first.")
+                 "the largest context over the smallest. Falloff = decode of the last third of the sustain run vs the first. "
+                 "Prefix kept = the A-after-B turn against the cold TTFT of A, and `slots` is how many conversations the "
+                 "server keeps live at once: at 1, B evicts A and A re-prefills, which is a property of the configuration, "
+                 "not of the engine's prefix reuse (Kapitsa's default 4 keeps A, see the *-4slots config).")
     return "\n".join(lines)
 
 
 AGENTIC_CSV_COLS = ["model", "display", "key", "engine", "version", "when"] + [k for k, *_ in AGENTIC_COLS] + [
-    "max_tokens", "warm_speedup", "followup_hit_rate", "kept", "interleave", "warm_hit_rate", "sustain_s", "idle_mb", "peak_mb", "invalid",
+    "max_tokens", "warm_speedup", "followup_hit_rate", "kept", "interleave", "slots", "warm_hit_rate", "sustain_s", "idle_mb", "peak_mb", "invalid",
     "flags", "contended", "ours", "file"]
 
 
