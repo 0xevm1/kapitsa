@@ -229,6 +229,33 @@ cost table says a wider verify pays can have it without paying the narrow cost e
 measured; the 27B's tok/s gain is within noise (the A/B above), so it is not claimed. With bf16 weights the verify is bound by memory instead: 16 rows cost 1.05× an 8-row
 verify, and the 4B ran 11-16% faster with the sizes forced.
 
+### Sixteen-row drafting blocks
+
+A 16-row verify spreads a coding answer over fewer passes (5.54 tokens per cycle against 4.81), but the drafter has to
+fill 15 rows instead of 7. Its first version drafted two 8-row tiles one after the other, and each tile streamed all of
+the drafter's weights, so the drafting pass doubled (12.4 ms per cycle against 6.7) and gave back what the wider verify
+won. The drafter's two tiles are 8-row tiles of the same GEMM (`dfl_put2` writes both), so a pair kernel (`qmm8t2d`)
+multiplies both from one weight load: each weight tile is read once and multiplied twice, one destination per tile.
+`NI_DFLASH_BLOCK=16` is opt-in, needs KFlash trees and a target with the wide verify, drafts with the matrix units only
+(an M5-class GPU on macOS 26, the tensor path on, 4-bit group-64 projections, not the v1 drafter: a load-time check says
+so rather than the first request), and leaves the default 8-row block untouched. The developer knobs that take the
+drafting pass or the attention off that path are refused the same way: `NI_DFLASH_ATTN=scalar`, `NI_AB=dfl=1` (the old
+attention) and `NI_AB=dfl=128` (the MLP's own `qmm8_gu`), and the debug dumps `dflash_check` turns on. Requests take
+turns while it is on: it drafts a depth-15 lattice and has no batched cycle, so two requests decoding together share no
+verify.
+
+A paired A/B on the 27B over a 256-token coding prompt (greedy, three interleaved runs each, `NI_ANE=0`, all under the
+GPU lock: MacBook Pro Mac17,8, Apple M5 Pro, macOS 26.5.2, this change's code) measures it: the default 8-row block runs
+67.5/68.5/68.6 tok/s at 4.81 tokens per cycle with cycles of 70.0-71.1 ms of GPU time, and `NI_DFLASH_BLOCK=16` runs
+71.3/72.1/72.5 tok/s at 5.54 tokens per cycle with cycles of 76.3-77.6 ms (median +5.3% at +15% tokens per cycle). The
+same block with the pair kernel off (`NI_DFL_PAIR=0`) runs 69.0/69.5/69.5 tok/s with cycles of 79.5-80.1 ms, so the pair
+GEMM is 3.5% of the cycle and all of the lead; without it the block measures at parity. At temperature 0.6 the same
+pairing gives 54.5/55.2/55.1 against 60.2/60.6/60.6 tok/s (median +10%). All nine greedy runs wrote the same ids as
+plain decoding (md5 `f84ce83a…`), acceptance by position matched to the last digit between the two drafting paths, and
+`logit_compare` of `logit_dump` from `main` (1079f08) and from this branch found the default path's every row bitwise
+identical (prefill 8 records, step 192, verify 192). Not checked: a whole-reply comparison over a corpus, the benchmark
+cells, and whether a 32-row drafting block (four tiles, two pairs) pays.
+
 ### The drafters as published
 
 KFlash reads the candidate lists and conditional scores the drafters already produce: z-lab's DFlash on Qwen3.5-4B,

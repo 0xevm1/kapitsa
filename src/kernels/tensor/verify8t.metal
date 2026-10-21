@@ -258,6 +258,145 @@ NI_INLINE void qmm8t2_impl(const device uint* const thread* Wv, const device ush
   }
 }
 
+// ---- Tile-pair variant for the drafter's 16-row drafting block (DFlash2 B=16) ----
+//
+// The drafter's X8 tables of two 8-row tiles are 16 rows apart (values rows 0-7, T table rows 8-15 of each tile; see
+// dfl_put2), so unlike qmm8t2 a pair cannot be one 16-row matmul: this variant runs the two 8-row products of a pair
+// from one weight load (Lw) and two separate T tables / sums blocks, which halves the drafter's weight traffic and its
+// dispatch count for the 16-row block. Destinations: rows t0 + kk of the pair's first tile and 8 + t0 + kk of the
+// second, in one contiguous 16-row Y (the drafter's y rows are contiguous over a block).
+template <int NT, int PF, int MAXKS>
+NI_INLINE void qmm8t2d_impl(const device uint* const thread* Wv, const device ushort* const thread* Sv,
+                            const device ushort* const thread* Bv, device float* const thread* Yv,
+                            const device half* T0, const device float* sums0, const device half* T1,
+                            const device float* sums1, constant Qmm8tParams& p, threadgroup float* red, uint tg,
+                            uint sg, uint lane) {
+  uint si = 0;
+  while (si + 1 < p.nseg && tg >= p.tg_begin[si + 1]) ++si;
+  const uint N = p.N[si], n0 = (tg - p.tg_begin[si]) * NT, gpr = p.K / 64, wpr = p.K / 8;
+  const uint gper = (gpr + p.ks - 1) / p.ks, g0 = min(sg * gper, gpr), g1 = min(g0 + gper, gpr);
+  const uint c = (lane & 1) | (((lane >> 3) & 1) << 1), r = ((lane >> 1) & 3) | (((lane >> 4) & 1) << 2);
+  constexpr auto desc = matmul2d_descriptor(NT, 8, 64, false, true, false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroup> op;
+  auto Lw = op.template get_left_input_cooperative_tensor<uint8_t, half, float>();
+  auto tX0 = tensor<device half, dextents<int32_t, 2>, tensor_inline>((device half*)T0, dextents<int32_t, 2>(p.K, 8));
+  auto tX1 = tensor<device half, dextents<int32_t, 2>, tensor_inline>((device half*)T1, dextents<int32_t, 2>(p.K, 8));
+  auto Rx0 = tX0.template slice<64, 8>(0, 0);
+  auto acc0 = op.template get_destination_cooperative_tensor<decltype(Lw), decltype(Rx0), float>();
+  auto acc1 = op.template get_destination_cooperative_tensor<decltype(Lw), decltype(Rx0), float>();
+  _Pragma("clang loop unroll(full)")
+  for (uint16_t i = 0; i < acc0.get_capacity(); ++i) acc0[i] = 0.0f, acc1[i] = 0.0f;
+  constexpr int NJ = NT / 8;
+  const device uint* wp[NJ];
+  const device ushort* sp[NJ];
+  const device ushort* bp[NJ];
+  _Pragma("clang loop unroll(full)")
+  for (int j = 0; j < NJ; ++j) {
+    const uint row = min(n0 + r + 8 * j, N - 1);
+    wp[j] = Wv[si] + row * wpr + 2 * c;
+    sp[j] = Sv[si] + row * gpr;
+    bp[j] = Bv[si] + row * gpr;
+  }
+  const uint t0 = 4 * (lane & 1);
+  uint2 wn[NJ];
+  ushort sn[NJ], bn[NJ];
+  auto load = [&](uint g) {
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < NJ; ++j) {
+      wn[j] = *(const device uint2*)(wp[j] + g * 8);
+      sn[j] = sp[j][g];
+      bn[j] = bp[j][g];
+    }
+  };
+  if (PF && g0 < g1) load(g0);
+  for (uint g = g0; g < g1; ++g) {
+    if (!PF) load(g);
+    uint2 w[NJ];
+    ushort sc[NJ], bc[NJ];
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < NJ; ++j) w[j] = wn[j], sc[j] = sn[j], bc[j] = bn[j];
+    if (PF && g + 1 < g1) load(g + 1);
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < NJ; ++j)
+      _Pragma("clang loop unroll(full)")
+      for (int jb = 0; jb < 4; ++jb) {
+        const uint u = ((jb >> 1 ? w[j].y : w[j].x) >> (4 * (jb & 1))) & 0x0F0F0F0Fu;
+        const int i = (j >> 1) * 32 + jb * 8 + (j & 1) * 4;
+        Lw[i] = uchar(u);
+        Lw[i + 1] = uchar(u >> 8);
+        Lw[i + 2] = uchar(u >> 16);
+        Lw[i + 3] = uchar(u >> 24);
+      }
+    const float4 sx0 = *(const device float4*)(sums0 + g * 8 + t0);
+    const float4 sx1 = *(const device float4*)(sums1 + g * 8 + t0);
+    {
+      auto Rxa = tX0.template slice<64, 8>(g * 64, 0);
+      auto d = op.template get_destination_cooperative_tensor<decltype(Lw), decltype(Rxa), float>();
+      op.run(Lw, Rxa, d);
+      _Pragma("clang loop unroll(full)")
+      for (int j = 0; j < NJ; ++j) {
+        const float s = as_type<float>(uint(sc[j]) << 16), b = as_type<float>(uint(bc[j]) << 16);
+        _Pragma("clang loop unroll(full)")
+        for (int kk = 0; kk < 4; ++kk) acc0[j * 4 + kk] = fma(s, d[j * 4 + kk], fma(b, sx0[kk], acc0[j * 4 + kk]));
+      }
+    }
+    {
+      auto Rxb = tX1.template slice<64, 8>(g * 64, 0);
+      auto d = op.template get_destination_cooperative_tensor<decltype(Lw), decltype(Rxb), float>();
+      op.run(Lw, Rxb, d);
+      _Pragma("clang loop unroll(full)")
+      for (int j = 0; j < NJ; ++j) {
+        const float s = as_type<float>(uint(sc[j]) << 16), b = as_type<float>(uint(bc[j]) << 16);
+        _Pragma("clang loop unroll(full)")
+        for (int kk = 0; kk < 4; ++kk) acc1[j * 4 + kk] = fma(s, d[j * 4 + kk], fma(b, sx1[kk], acc1[j * 4 + kk]));
+      }
+    }
+  }
+  // fixed-order sum of the k-slices (simdgroup 0 adds 1, 2, ... in turn), the pair's two tiles in turn
+  if (p.ks > 1) {
+    constexpr uint cap = NT / 2;
+    if (sg)
+      _Pragma("clang loop unroll(full)")
+      for (uint i = 0; i < cap; ++i) red[((sg - 1) * cap + i) * 32 + lane] = acc0[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!sg)
+      for (uint j = 1; j < p.ks; ++j)
+        _Pragma("clang loop unroll(full)")
+        for (uint i = 0; i < cap; ++i) acc0[i] += red[((j - 1) * cap + i) * 32 + lane];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg)
+      _Pragma("clang loop unroll(full)")
+      for (uint i = 0; i < cap; ++i) red[((sg - 1) * cap + i) * 32 + lane] = acc1[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!sg)
+      for (uint j = 1; j < p.ks; ++j)
+        _Pragma("clang loop unroll(full)")
+        for (uint i = 0; i < cap; ++i) acc1[i] += red[((j - 1) * cap + i) * 32 + lane];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg) return;  // the k-slices are summed in simdgroup 0 (as qmm8t)
+  }
+  if ((lane >> 3) & 1) return;  // padding rows
+  device float* Y = Yv[si];
+  const uint y_ld = p.y_ld[si];
+  const bool add = p.add[si] != 0;
+  _Pragma("clang loop unroll(full)")
+  for (int j = 0; j < NJ; ++j) {
+    const uint n = n0 + r + 8 * j;
+    if (n >= N) continue;
+    _Pragma("clang loop unroll(full)")
+    for (int kk = 0; kk < 4; ++kk) {
+      const uint t = t0 + kk;
+      if (t < p.R) {
+        device float* dst = Y + t * y_ld + n;
+        *dst = add ? *dst + acc0[j * 4 + kk] : acc0[j * 4 + kk];
+      }
+      const uint t2 = 8 + t;
+      device float* dst2 = Y + t2 * y_ld + n;
+      if (t2 < p.R) *dst2 = add ? *dst2 + acc1[j * 4 + kk] : acc1[j * 4 + kk];
+    }
+  }
+}
+
 #define NI_QMM8T(NAME, NT, PF, MAXKS)                                                                         \
   [[kernel]] void NAME(const device uint* W0 [[buffer(0)]], const device ushort* S0 [[buffer(1)]],           \
                        const device ushort* B0 [[buffer(2)]], device float* Y0 [[buffer(3)]],                \
@@ -309,3 +448,29 @@ NI_QMM8T2(qmm8t2_b4_nt16, 16, 0, 8)
 NI_QMM8T2(qmm8t2_b4_nt32, 32, 0, 8)
 NI_QMM8T2(qmm8t2p_b4_nt16, 16, 1, 8)
 NI_QMM8T2(qmm8t2p_b4_nt32, 32, 1, 8)
+
+#define NI_QMM8T2D(NAME, NT, PF, MAXKS)                                                                        \
+  [[kernel]] void NAME(const device uint* W0 [[buffer(0)]], const device ushort* S0 [[buffer(1)]],           \
+                       const device ushort* B0 [[buffer(2)]], device float* Y0 [[buffer(3)]],                \
+                       const device uint* W1 [[buffer(4)]], const device ushort* S1 [[buffer(5)]],           \
+                       const device ushort* B1 [[buffer(6)]], device float* Y1 [[buffer(7)]],                \
+                       const device uint* W2 [[buffer(8)]], const device ushort* S2 [[buffer(9)]],           \
+                       const device ushort* B2 [[buffer(10)]], device float* Y2 [[buffer(11)]],              \
+                       const device uint* W3 [[buffer(12)]], const device ushort* S3 [[buffer(13)]],         \
+                       const device ushort* B3 [[buffer(14)]], device float* Y3 [[buffer(15)]],              \
+                       const device half* T0 [[buffer(16)]], const device float* sums0 [[buffer(17)]],       \
+                       const device half* T1 [[buffer(18)]], const device float* sums1 [[buffer(19)]],       \
+                       constant Qmm8tParams& p [[buffer(20)]], uint tg [[threadgroup_position_in_grid]],     \
+                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float red[(MAXKS - 1) * (NT / 2) * 32];                                                      \
+    const device uint* Wv[4] = {W0, W1, W2, W3};                                                              \
+    const device ushort* Sv[4] = {S0, S1, S2, S3};                                                            \
+    const device ushort* Bv[4] = {B0, B1, B2, B3};                                                            \
+    device float* Yv[4] = {Y0, Y1, Y2, Y3};                                                                   \
+    qmm8t2d_impl<NT, PF, MAXKS>(Wv, Sv, Bv, Yv, T0, sums0, T1, sums1, p, red, tg, sg, lane);                  \
+  }
+
+NI_QMM8T2D(qmm8t2d_b4_nt16, 16, 0, 8)
+NI_QMM8T2D(qmm8t2d_b4_nt32, 32, 0, 8)
+NI_QMM8T2D(qmm8t2dp_b4_nt16, 16, 1, 8)
+NI_QMM8T2D(qmm8t2dp_b4_nt32, 32, 1, 8)

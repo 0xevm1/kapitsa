@@ -767,6 +767,9 @@ void Encoder::dispatch(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t tx, uint3
         [nb computeCommandEncoderWithDispatchType:concurrent_ ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
     cb_ = (__bridge_retained void*)nb;
     enc_ = (__bridge_retained void*)ne;
+    // the fresh encoder starts with no pipeline state: a kernel dispatched twice under one use() (a loop over tiles)
+    // would otherwise dispatch it with none
+    if (cur_pso_) [ne setComputePipelineState:(__bridge id<MTLComputePipelineState>)cur_pso_];
   }
 }
 void Encoder::dispatch_indirect(const Buffer& args, size_t off, uint32_t tx, uint32_t ty, uint32_t tz) {
@@ -793,6 +796,7 @@ void Encoder::dispatch_indirect(const Buffer& args, size_t off, uint32_t tx, uin
         [nb computeCommandEncoderWithDispatchType:concurrent_ ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
     cb_ = (__bridge_retained void*)nb;
     enc_ = (__bridge_retained void*)ne;
+    if (cur_pso_) [ne setComputePipelineState:(__bridge id<MTLComputePipelineState>)cur_pso_];
   }
 }
 void Encoder::barrier() { [E(enc_) memoryBarrierWithScope:MTLBarrierScopeBuffers]; }

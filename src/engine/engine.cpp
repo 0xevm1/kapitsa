@@ -893,6 +893,9 @@ int Engine::batch_rows(int n) const {
     return v && *v ? atoi(v) : -1;
   }();
   if (mode == 0 || n < 2 || n > 8 || (!dfl_ && !lili_) || (mode < 0 && !batch_measured_)) return 0;
+  // a 16-row drafting block has no batched cycle: it drafts a depth-15 lattice with the pair kernel, and the batch loop
+  // drafts 7-token chains (encode_draft with tree = false), so the requests take turns instead
+  if (dfl_ && DFlash2::block() > DFlash2::kB) return 0;
   // NI_BATCH_ROWS="n:rows,...": rows per member for n members (0: take turns)
   static const std::vector<int> env = [] {
     std::vector<int> t(9, -1);
@@ -1092,7 +1095,7 @@ void Engine::batch_cycle(int rows) {
       Slot& sl = *j->slot;
       DFlashSeq& d = *sl.dseq;
       dfl_->stage_init(d);
-      if (d.staged > 0 && (k > 0 || d.staged == DFlash2::kB)) dfl_->encode_commit_staged(*e1, d), e1_work = true;
+      if (d.staged > 0 && (k > 0 || d.staged == DFlash2::block())) dfl_->encode_commit_staged(*e1, d), e1_work = true;
       if (k > 0) {
         const bool sampled = exact && j->sp.temperature > 0;
         dfl_->encode_draft(*e1, *sl.seq, d, j->P, sampled ? j->sp : greedy);
@@ -2549,7 +2552,8 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     bool go = handle(s.tokens()[n]);
     // the KV room a cycle wants: the next anchor (at most P + 8) and its verify's rows (KFlash trees: up to 32; with
     // less room the drafting pass verifies fewer, DFlash2::tree_cap_)
-    const int vrows = dfl_->tree() ? std::max(DFlash2::kB, dfl_->tree_rows()) : DFlash2::kB;
+    const int Bk = DFlash2::block();  // the drafting block (8, or 16 rows: NI_DFLASH_BLOCK)
+    const int vrows = dfl_->tree() ? std::max(Bk, dfl_->tree_rows()) : Bk;
     for (;;) {
       int m = 0, a_last = 0;
       const bool masked = gm && g_on;
@@ -2560,11 +2564,11 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
       // comes back after parking), with KV cache room for the first cycles (it grows between cycles below): nothing may
       // use the old buffers, so the deferred prompt work completes first
       auto start_cycles = [&] {
-        if (P + 8 + 8 + vrows + 3 > s.cap && s.cap < s.limit) {
+        if (P + Bk + Bk + vrows + 3 > s.cap && s.cap < s.limit) {
           if (mtp_e) mtp_e->wait();
-          grow_kv(std::min(s.limit, P + 8 + 8 + vrows + 3), [] {});
+          grow_kv(std::min(s.limit, P + Bk + Bk + vrows + 3), [] {});
         }
-        if (P + 8 + DFlash2::kB + 2 < s.cap) {
+        if (P + Bk + Bk + 2 < s.cap) {
           // host write of the drafter state: nothing in flight reads it (the prefill is done; its deferred
           // prompt commit, if still running, is host-driven; a request taking its turn has nothing in flight)
           dfl_->gpu_state_reset(P);
@@ -2607,22 +2611,22 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
           Gpu::signal_event_cpu(mask_event_, pending);
         }
         bool kv_wait = false;  // no KV room for the next cycle while other requests' caches hold the memory
-        if (P + 8 + 8 + vrows + 3 > s.cap && s.cap < s.limit) {
+        if (P + Bk + Bk + vrows + 3 > s.cap && s.cap < s.limit) {
           // the KV cache grows here: the verify in flight (and the drafting half before it) complete first, so
           // this cycle's drafting half is not overlapped with it
           e2->wait();
-          kv_wait = !reserve_kv(slot, std::min(s.limit, P + 8 + 8 + vrows + 3), true) && active_ > 1;
+          kv_wait = !reserve_kv(slot, std::min(s.limit, P + Bk + Bk + vrows + 3), true) && active_ > 1;
         }
         // another request waits for the GPU, this one for memory (start_cycles waits for it), or it joins the batch:
         // no drafting half behind this verify, park after it
         const bool turn = contended();
         const bool join = !kv_wait && batch_wanted();  // (a request waiting for memory would leave the batch at once)
         const bool park = turn || kv_wait || join;
-        const bool room = P + 8 + 8 + DFlash2::kB + 2 < s.cap;  // the next anchor is at most P + 8
+        const bool room = P + Bk + Bk + Bk + 2 < s.cap;  // the next anchor is at most P + Bk
         park_last = park && room;
         if (!park && room) {
           next_draft = g.begin();
-          dfl_->encode_cycle_draft_gpu(*next_draft, s, d, P + 8, sp);
+          dfl_->encode_cycle_draft_gpu(*next_draft, s, d, P + Bk, sp);
           next_draft->commit();
         }
         e2->wait();

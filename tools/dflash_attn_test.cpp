@@ -6,11 +6,17 @@
 // GPU-planned. DAT_MMA_ONLY=1 skips the scalar kernel (its threadgroup memory exceeds what the two Metal validation
 // layers together allow), DAT_REPS=n times n back-to-back pairs per command buffer, DAT_PARTS=1/2 only the attention
 // / the reduce, DAT_SRC=<file> + DAT_KERNEL=<name> (+ DAT_THREADS) a variant appended to the library.
+// The last check is the 16-row drafting block's pair GEMM (qmm8t2d / qmm8t2dp) against two per-tile qmm8t dispatches
+// on the same T tables, bitwise; it needs the tensor library (Apple10, macOS 26) and is skipped otherwise.
 #include "metal/gpu.h"
 #include "model/dflash2.h"
 #include "model/kparams.h"
 #include "util/bf16.h"
 #include "util/log.h"
+
+namespace ni {
+extern const char* const kTensorKernelSource;  // src/kernels/tensor/*: qmm8t2d (the 16-row drafting block's pair GEMM)
+}
 
 #include <algorithm>
 #include <cmath>
@@ -165,6 +171,7 @@ int main(int argc, char** argv) {
         e.buf(0, inv); e.buf(1, cs);
         e.val(2, Pk);
         e.buf(3, gst);
+        e.val(4, 512u);  // rows of the table: 8 rows x 64 dims
         e.dispatch(1, 1, 1, 512);
       };
       for (uint32_t splits : {8u, 16u, 32u})
@@ -242,6 +249,105 @@ int main(int argc, char** argv) {
                  "GPU attn+reduce median %.4f ms\n", P, gpu ? "gpu " : "host", splits, chunk, nsplit, md, ref, sd,
                  ts[ts.size() / 2]);
         }
+    }
+  }
+  // A 16-row drafting block is two 8-row tiles (dfl_put2): qmm8t2d computes the pair from one weight load where the
+  // per-tile path (qmm8t, dflash2.cpp enc_qmm8 with NI_DFL_PAIR=0) streams the weights once per tile. The pair must be
+  // exact against two per-tile dispatches on the same tables: every one of the 16 x N outputs bitwise identical.
+  // T tables and group sums come from x8_prep2 (write_t), the layout dfl_put2 writes; both tiling rules the drafter
+  // picks are covered: K 2048 (K / 64 = 32: nt 16, no prefetch, ks 8) and K 4096 (K / 64 = 64: nt 32, prefetch, ks 4).
+  const bool tensor_ok = [] {
+    if (__builtin_available(macOS 26.0, *)) return true;
+    return false;
+  }();
+  if (g.apple_family() >= 10 && tensor_ok) {
+    g.compile_extra("tensor", ni::kTensorKernelSource, true);
+    if (!g.pipeline("qmm8t2d_b4_nt16", false).pso) {
+      printf("qmm8t2d: the tensor library did not build, skipped\n");
+    } else {
+      struct Case { uint32_t K, nt, pf, ks; };
+      for (const Case c : {Case{2048, 16, 0, 8}, Case{4096, 32, 1, 4}}) {
+        const uint32_t K = c.K, N = 1024, R16 = 16, gpr = K / 64;
+        Buffer w = g.alloc(size_t(N) * K / 8 * 4), s = g.alloc(size_t(N) * gpr * 2), b = g.alloc(size_t(N) * gpr * 2);
+        for (size_t i = 0; i < size_t(N) * K / 8; ++i) w.as<uint32_t>()[i] = rng();
+        for (size_t i = 0; i < size_t(N) * gpr; ++i) {
+          s.as<uint16_t>()[i] = f32_to_bf16(0.001f + 0.02f * std::fabs(nd(rng)));
+          b.as<uint16_t>()[i] = f32_to_bf16(0.01f * nd(rng));
+        }
+        Buffer x = g.alloc(size_t(R16) * K * 4), xw = g.alloc(256 * 2), xh = g.alloc(size_t(R16) * K * 2),
+               tt = g.alloc(size_t(R16) * K * 2), sm = g.alloc(size_t(gpr) * R16 * 4),
+               ya = g.alloc(size_t(R16) * N * 4), yb = g.alloc(size_t(R16) * N * 4);
+        for (size_t i = 0; i < size_t(R16) * K; ++i) x.as<float>()[i] = nd(rng);
+        for (int i = 0; i < 256; ++i) xw.as<uint16_t>()[i] = f32_to_bf16(1.0f);
+        {  // the 16 rows' T tables (8 rows per tile, tile t at 8 t rows) and their group sums, as dfl_put2 lays them out
+          auto e = g.begin();
+          kp::X8Prep pp{K, R16, K, 0, 0, 1e-6f, K, 0, 0, 1};
+          e->use(g.pipeline("x8_prep2"));
+          e->buf(0, x); e->buf(1, xw); e->buf(2, xh); e->buf(3, sm); e->buf(4, x);
+          e->val(5, pp);
+          e->buf(6, xh); e->buf(7, sm); e->buf(8, tt);
+          e->dispatch(K / 256, 2, 1, 256);
+          e->commit_and_wait();
+        }
+        const uint32_t tg = N / c.nt;
+        kp::Qmm8 p{};
+        p.K = K;
+        p.nseg = 1;
+        p.ks = c.ks;
+        p.N[0] = N;
+        p.y_ld[0] = N;
+        p.add[0] = 0;
+        p.tg_begin[0] = 0;
+        p.tg_begin[1] = tg;
+        auto bind = [&](Encoder& e, Buffer& y, uint32_t y_row) {
+          for (int i = 0; i < 4; ++i) {
+            e.buf(i * 4 + 0, w);
+            e.buf(i * 4 + 1, s);
+            e.buf(i * 4 + 2, b);
+            e.buf(i * 4 + 3, y, size_t(y_row) * N * 4);
+          }
+        };
+        {
+          auto e = g.begin();
+          e->use(g.pipeline(std::string(c.pf ? "qmm8tp_b4_nt" : "qmm8t_b4_nt") + std::to_string(c.nt)));
+          p.R = 8;
+          for (uint32_t t = 0; t < 2; ++t) {  // per tile: its own T table, sums and 8 output rows
+            bind(*e, ya, 8 * t);
+            e->buf(16, tt, size_t(t) * 8 * K * 2);
+            e->buf(17, sm, size_t(t) * gpr * 8 * 4);
+            e->val(18, p);
+            e->dispatch(tg, 1, 1, 32 * c.ks);
+          }
+          e->commit_and_wait();
+        }
+        {
+          auto e = g.begin();
+          e->use(g.pipeline(std::string(c.pf ? "qmm8t2dp_b4_nt" : "qmm8t2d_b4_nt") + std::to_string(c.nt)));
+          p.R = R16;
+          bind(*e, yb, 0);
+          e->buf(16, tt, 0);
+          e->buf(17, sm, 0);
+          e->buf(18, tt, size_t(8) * K * 2);
+          e->buf(19, sm, size_t(gpr) * 8 * 4);
+          e->val(20, p);
+          e->dispatch(tg, 1, 1, 32 * c.ks);
+          e->commit_and_wait();
+        }
+        size_t bad = 0;
+        double mx = 0, rms = 0;
+        for (size_t i = 0; i < size_t(R16) * N; ++i) {
+          const double d = double(ya.as<float>()[i]) - double(yb.as<float>()[i]);
+          mx = std::max(mx, std::fabs(d));
+          rms += d * d;
+          if (ya.as<uint32_t>()[i] != yb.as<uint32_t>()[i]) ++bad;
+        }
+        double ref = 0;
+        for (size_t i = 0; i < size_t(R16) * N; ++i) ref += double(ya.as<float>()[i]) * ya.as<float>()[i];
+        printf("qmm8t2d%-4s N=%u K=%u (nt %u, ks %u): %zu of %zu outputs differ from the per-tile qmm8t runs "
+               "(max |d| %.2e, rms %.2e of rms %.2e)%s\n", c.pf ? "pf" : "", N, K, c.nt, c.ks, bad,
+               size_t(R16) * N, mx, std::sqrt(rms / (R16 * N)), std::sqrt(ref / (R16 * N)),
+               bad ? "  NOT EXACT" : "");
+      }
     }
   }
   return 0;

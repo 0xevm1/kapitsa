@@ -187,6 +187,7 @@ struct DflNorm {
 struct DflConv {
   uint32_t H, G;
   float eps;
+  uint32_t prev0 = 0;
 };
 
 struct DflQk {
@@ -209,6 +210,7 @@ struct DflAttnQk {
 struct DflAttnRed {
   uint32_t nsplit;
   uint32_t P, lo, chunk;
+  uint32_t nr = 8;  // block rows (8, or 16 = two X8 tiles)
 };
 
 struct DflCommit {

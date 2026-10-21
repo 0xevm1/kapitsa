@@ -25,7 +25,12 @@ NI_INLINE uint dfl_tslot(uint i) {
 }
 
 // Group g (64 values) of row r: two values per lane -> half table (+ its T table) + exact sum of the halfs.
+// 16-row blocks (DFlash2 B=16) are two 8-row tiles: row r >= 8 goes to tile r / 8 at xh + tile * 16 ld (its own
+// half + T table) and xs + tile * ld / 8 (identical to the single tile for r < 8).
 NI_INLINE void dfl_put2(device half* xh, device float* xs, uint r, uint ld, uint g, uint lane, float v0, float v1) {
+  xh += (r >> 3) * 16 * size_t(ld);
+  xs += (r >> 3) * (ld / 8);
+  r &= 7u;
   const half2 hv = half2(half(v0), half(v1));
   *(device half2*)(xh + r * ld + g * 64 + 2 * lane) = hv;
   device half* t = xh + (8 + r) * ld + g * 64;
@@ -192,6 +197,7 @@ struct DflNormParams {
 struct DflConvParams {
   uint H, G;      // hidden, conv groups (H / 16)
   float eps;
+  uint prev0;     // 1: row 0 is the second tile of a 16-row block (x[-1] row = the previous tile's last row, valid memory)
 };
 // Prepare stage: a[r] = (b00 + D[r,0,g]) x[r] + (b01 + D[r,1,g]) x[r-1] -> X8 table.
 [[kernel]] void dfl_conv_prep(const device float* x [[buffer(0)]], const device float* D [[buffer(1)]],
@@ -253,8 +259,8 @@ struct DflConvParams {
 // cs[r * 64 + i] = (cos, sin)(float(P + r) * inv_freq[i]). grid 1 x 512.
 [[kernel]] void dfl_rope_table(const device float* inv_freq [[buffer(0)]], device float2* cs [[buffer(1)]],
                                constant uint& P [[buffer(2)]], const device uint* gst [[buffer(3)]],
-                               uint i [[thread_position_in_grid]]) {
-  if (i >= 512) return;
+                               constant uint& nthr [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+  if (i >= nthr) return;  // 64 per block row (512, or 1024 for 16-row blocks)
   const float ang = float(dfl_pos(P, gst) + i / 64) * inv_freq[i % 64];
   cs[i] = float2(metal::precise::cos(ang), metal::precise::sin(ang));
 }
@@ -577,28 +583,25 @@ struct DflAttnQkParams {
   float scale, eps;
   uint q_ld, kv_ld;
 };
-[[kernel]] void dfl_attn_qk(const device float* q [[buffer(0)]], const device float* kv [[buffer(1)]],
-                            const device bfloat* qn [[buffer(2)]], const device bfloat* kn [[buffer(3)]],
-                            const device float2* cs [[buffer(4)]], const device bfloat* ringK [[buffer(5)]],
-                            const device bfloat* ringV [[buffer(6)]], device float* part_o [[buffer(7)]],
-                            device float* part_ml [[buffer(8)]], constant DflAttnQkParams& p [[buffer(9)]],
-                            const device uint* gst [[buffer(10)]],
-                            uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                            uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+// NB block rows (8, or 16 = two row tiles: threadgroup z picks the tile of 8 query rows; every tile sees all NB block keys)
+template <uint NB>
+NI_INLINE void dfl_attn_qk_impl(const device float* q, const device float* kv, const device bfloat* qn,
+                                const device bfloat* kn, const device float2* cs, const device bfloat* ringK,
+                                const device bfloat* ringV, device float* part_o, device float* part_ml,
+                                constant DflAttnQkParams& p, const device uint* gst, threadgroup half* ks,
+                                threadgroup half* vs, threadgroup float* kf, uint3 tg, uint tid, uint sg,
+                                uint lane) {
   constexpr uint TK = 32, LD = 136;
-  threadgroup half ks[TK * LD];
-  threadgroup half vs[TK * LD];
-  threadgroup float kf[8 * 128];  // the block keys after k_norm (before RoPE)
-  const uint split = tg.x, g = tg.y, h = g * 4 + sg;
+  const uint split = tg.x, g = tg.y, h = g * 4 + sg, row0 = tg.z * 8;
   uint P = p.P, lo = p.lo, chunk = p.chunk, nsplit = p.nsplit;
   dfl_attn_geom(gst, P, lo, chunk, nsplit);
   if (split >= nsplit) return;
   const bool last = split + 1 == nsplit;
   const uint2 rc = dfl_lane_rc(lane);
-  const uint fm = rc.x, fn = rc.y;
+  const uint fm = rc.x, fn = rc.y, qrow = row0 + fm;
   simdgroup_half8x8 qf[16];
   {  // Q = RoPE(RMSNorm_head(q; q_norm)) * scale, row fm (= block row) of head h, dims 8c + fn + e
-    const device float* qr = q + fm * p.q_ld + h * 128 + fn;
+    const device float* qr = q + qrow * p.q_ld + h * 128 + fn;
     float2 v[16];
     float ss = 0.0f;
     _Pragma("clang loop unroll(full)")
@@ -616,7 +619,7 @@ struct DflAttnQkParams {
     }
     _Pragma("clang loop unroll(full)")
     for (int c = 0; c < 8; ++c) {
-      const float4 t = *(const device float4*)(cs + fm * 64 + c * 8 + fn);  // (cos, sin) of dims d, d + 1
+      const float4 t = *(const device float4*)(cs + qrow * 64 + c * 8 + fn);  // (cos, sin) of dims d, d + 1
       const float2 a = v[c], b = v[c + 8];
       qf[c].thread_elements()[0] = half((a.x * t.x - b.x * t.y) * p.scale);
       qf[c].thread_elements()[1] = half((a.y * t.z - b.y * t.w) * p.scale);
@@ -624,8 +627,9 @@ struct DflAttnQkParams {
       qf[c + 8].thread_elements()[1] = half((b.y * t.z + a.y * t.w) * p.scale);
     }
   }
-  if (last) {  // block key `key` (thread: 8 dims d0..d0+7): k_norm into kf
-    const uint key = tid / 16, d0 = (tid % 16) * 8;
+  if (last) {  // block keys `key` (thread: 8 dims d0..d0+7): k_norm into kf
+  for (uint key = tid / 16; key < NB; key += 8) {
+    const uint d0 = (tid % 16) * 8;
     const device float* kr = kv + key * p.kv_ld + g * 128 + d0;
     const float4 a = *(const device float4*)kr, b = *(const device float4*)(kr + 4);
     float ss = dot(a, a) + dot(b, b);
@@ -639,6 +643,7 @@ struct DflAttnQkParams {
       kf[key * 128 + d0 + i] = a[i] * inv * float(kn[d0 + i]);
       kf[key * 128 + d0 + 4 + i] = b[i] * inv * float(kn[d0 + 4 + i]);
     }
+  }
   }
   const device bfloat* Kr = ringK + size_t(g) * kDflRing * 128;
   const device bfloat* Vr = ringV + size_t(g) * kDflRing * 128;
@@ -661,7 +666,7 @@ struct DflAttnQkParams {
       if (blk) {
         for (int i = 0; i < 32; ++i) {
           float kk = 0.0f, vv = 0.0f;
-          if (key < 8) {
+          if (key < NB) {
             const uint d = d0 + i, j = d & 63;
             const float2 c = cs[key * 64 + j];
             const threadgroup float* kr = kf + key * 128;
@@ -702,7 +707,7 @@ struct DflAttnQkParams {
       _Pragma("clang loop unroll(full)")
       for (int e = 0; e < 2; ++e) {
         const uint kk = kb * 8 + fn + e, j = j0 + kk;
-        const bool vis = blk ? kk < 8 : (j < j_end && j + (kDflRing - 1) >= P + fm);
+        const bool vis = blk ? kk < NB : (j < j_end && j + (kDflRing - 1) >= P + qrow);
         const float v = vis ? sf[kb].thread_elements()[e] : -INFINITY;
         sv[kb * 2 + e] = v;
         tmax = max(tmax, v);
@@ -740,7 +745,7 @@ struct DflAttnQkParams {
         simdgroup_multiply_accumulate(of[c], pf[kb], vf, of[c]);
       }
   }
-  const size_t base = (size_t(split) * 32 + h) * 8 + fm;
+  const size_t base = (size_t(split) * 32 + h) * NB + qrow;
   _Pragma("clang loop unroll(full)")
   for (int c = 0; c < 16; ++c)
     *(device float2*)(part_o + base * 128 + c * 8 + fn) =
@@ -751,9 +756,38 @@ struct DflAttnQkParams {
   }
 }
 
+[[kernel]] void dfl_attn_qk(const device float* q [[buffer(0)]], const device float* kv [[buffer(1)]],
+                            const device bfloat* qn [[buffer(2)]], const device bfloat* kn [[buffer(3)]],
+                            const device float2* cs [[buffer(4)]], const device bfloat* ringK [[buffer(5)]],
+                            const device bfloat* ringV [[buffer(6)]], device float* part_o [[buffer(7)]],
+                            device float* part_ml [[buffer(8)]], constant DflAttnQkParams& p [[buffer(9)]],
+                            const device uint* gst [[buffer(10)]], uint3 tg [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup half ks[32 * 136];
+  threadgroup half vs[32 * 136];
+  threadgroup float kf[8 * 128];  // the block keys after k_norm (before RoPE)
+  dfl_attn_qk_impl<8>(q, kv, qn, kn, cs, ringK, ringV, part_o, part_ml, p, gst, ks, vs, kf, tg, tid, sg, lane);
+}
+
+[[kernel]] void dfl_attn_qk16(const device float* q [[buffer(0)]], const device float* kv [[buffer(1)]],
+                              const device bfloat* qn [[buffer(2)]], const device bfloat* kn [[buffer(3)]],
+                              const device float2* cs [[buffer(4)]], const device bfloat* ringK [[buffer(5)]],
+                              const device bfloat* ringV [[buffer(6)]], device float* part_o [[buffer(7)]],
+                              device float* part_ml [[buffer(8)]], constant DflAttnQkParams& p [[buffer(9)]],
+                              const device uint* gst [[buffer(10)]], uint3 tg [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup half ks[32 * 136];
+  threadgroup half vs[32 * 136];
+  threadgroup float kf[16 * 128];
+  dfl_attn_qk_impl<16>(q, kv, qn, kn, cs, ringK, ringV, part_o, part_ml, p, gst, ks, vs, kf, tg, tid, sg, lane);
+}
+
 struct DflAttnRedParams {
   uint nsplit;
   uint P, lo, chunk;  // P == kDflGpu: the split plan of dfl_attn_geom (nsplit derived from gst)
+  uint nr;            // block rows (8, or 16 = two X8 tiles)
 };
 // Combines the splits in order; writes o as the o_proj X8 table (K = 4096). grid (32, 8) x 128.
 [[kernel]] void dfl_attn_reduce(const device float* part_o [[buffer(0)]], const device float* part_ml [[buffer(1)]],
@@ -767,10 +801,10 @@ struct DflAttnRedParams {
   uint P = p.P, lo = p.lo, chunk = p.chunk, nsplit = p.nsplit;
   dfl_attn_geom(gst, P, lo, chunk, nsplit);
   float mx = -INFINITY;
-  for (uint s = 0; s < nsplit; ++s) mx = max(mx, part_ml[((s * 32 + h) * 8 + r) * 2]);
+  for (uint s = 0; s < nsplit; ++s) mx = max(mx, part_ml[((s * 32 + h) * p.nr + r) * 2]);
   float num = 0.0f, den = 0.0f;
   for (uint s = 0; s < nsplit; ++s) {
-    const size_t base = (size_t(s) * 32 + h) * 8 + r;
+    const size_t base = (size_t(s) * 32 + h) * p.nr + r;
     const float m = part_ml[base * 2];
     if (m == -INFINITY) continue;
     const float w = exp(m - mx);
@@ -778,14 +812,18 @@ struct DflAttnRedParams {
     den += w * part_ml[base * 2 + 1];
   }
   const half o = half(num / den);
-  xh[r * 4096 + h * 128 + d] = o;
-  xh[(8 + r) * 4096 + h * 128 + (d & 64u) + dfl_tslot(d & 63u)] = o;  // T table
+  const uint rt = r >> 3;  // X8 tile of the row (16-row blocks: each tile has its own half + T table and sums)
+  xh += size_t(rt) * 16 * 4096;
+  xs += rt * 512;
+  const uint r8 = r & 7u;
+  xh[r8 * 4096 + h * 128 + d] = o;
+  xh[(8 + r8) * 4096 + h * 128 + (d & 64u) + dfl_tslot(d & 63u)] = o;  // T table
   const float sm = simd_sum(float(o));
   if (lane == 0) red[sg] = sm;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (d == 0) {
-    xs[(2 * h) * 8 + r] = red[0] + red[1];
-    xs[(2 * h + 1) * 8 + r] = red[2] + red[3];
+    xs[(2 * h) * 8 + r8] = red[0] + red[1];
+    xs[(2 * h + 1) * 8 + r8] = red[2] + red[3];
   }
 }
 
@@ -1220,7 +1258,7 @@ DFL_QMM8(dfl_qmm8_r2, 2)
   for (uint r = 0; r < 8; ++r) {
     const float d0 = dd[rbl][j][r], d1 = dd[rbl][4 + j][r];
     const float2 xc = *(const device float2*)(x + r * H + c);
-    const float2 xp = r > 0 ? *(const device float2*)(x + (r - 1) * H + c) : float2(0.0f);
+    const float2 xp = (r > 0 || cp.prev0) ? *(const device float2*)(x + (int(r) - 1) * int(H) + c) : float2(0.0f);
     const float2 a = (b0 + d0) * xc + (b1 + d1) * xp;
     dfl_put2(xh2, xs2, r, H, rb, lane, a.x, a.y);
   }
