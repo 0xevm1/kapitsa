@@ -42,11 +42,13 @@ cat, macs, versions = cc.catalog(), cc.mac_models(), cc.known_versions(use_git=F
 check(list(cat) == ["qwen3.5-4b", "qwen3.5-9b", "qwen3.8-27b", "qwen3.6-35b-a3b", "qwen3.8-flash-next", "nemotron-labs-dory1.0-4b",
                    "nemotron-3-nano-4b", "nemotron-nano-9b-v2", "nemotron-3.5-lightning", "nemotron-3.5-bolt", "nemotron-3.5-super-vl"], "the catalog's models, in order",
       str(list(cat)))
-check(cat["qwen3.6-35b-a3b"]["variants"] == {"4bit": "4-bit", "5bit": "5-bit", "6bit": "6-bit", "8bit": "8-bit", "bf16": "bf16"},
+check(cat["qwen3.6-35b-a3b"]["variants"] == {"4bit": "4-bit", "5bit": "5-bit", "6bit": "6-bit", "8bit": "8-bit", "bf16": "bf16",
+                                                   "16gb": "2-bit experts"},
       "the 35B's precisions", str(cat["qwen3.6-35b-a3b"]["variants"]))
 check(cat["nemotron-3.5-bolt"]["variants"] == {"24gb": "NVIDIA 24 GB"} and cat["qwen3.5-4b"]["title"] == "Qwen3.5-4B",
       "Bolt's precision and the 4B's title")
 check(macs["Mac16,7"]["name"] == "MacBook Pro (16-inch, 2024)" and len(macs) >= 58, "the Mac table")
+check(cat["qwen3.8-flash-next"]["variants"] == {"4bit": "4-bit"}, "a variant whose .quant string spans several lines is still read")
 check(versions, "a known version from CMakeLists.txt", str(versions))
 
 # ---------------------------------------------------------------- accepted, refused, warned
