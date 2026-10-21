@@ -14,6 +14,8 @@ compiles in the background, and a prefill's numbers depend on whether it was rea
      and written); killed; a new one: the third's turn 2 is cached
   5. models that read images: a conversation that starts with an image, across a restart as from RAM, without encoding
      the image again
+  6. a DFlash drafter (when the server loads one): a long system block, then the server stops (SIGTERM): it must save
+     without crashing (the prefix checkpoint has no drafter ring), and the follow-up is cached after a restart
 usage: test_disk_cache.py <kapitsa> <model dir> [--tokens 4000] [--port 8197] [--server-args "--dflash none"] [--keep]
        test_disk_cache.py <kapitsa> <model dir> --ttft [--tokens N] [--rounds 2]
   --ttft: measures instead, per round: a server (cache on) writes turn 1 and stops; the next one answers turn 2 from the
@@ -313,6 +315,28 @@ def functional(tmp, log):
         check(d6 == r6, "... and writes the RAM path's text", f"\n RAM:  {r6!r}\n SSD:  {d6!r}")
         check(re.search(r"chat: 1 image\(s\), \d+ tokens: 0 encoded .*, 1 in the cached prefix", s.text()[m:]) is not None,
               "... without encoding the image again (its rows come from the SSD)", s.text()[m:][-500:])
+        s.stop()
+
+    # 6. a DFlash drafter (the server's own choice, or --server-args "--dflash <drafter>"): the prompt's prefix checkpoint
+    #    has no drafter ring, and the save at stop used to dereference its null ring (a segfault: the server died at
+    #    SIGTERM). Runs when the server's log says it loads a DFlash2 drafter.
+    s = Server(os.path.join(tmp, "home-dflash"), log)
+    if "DFlash2 drafter" not in s.text()[s.start_at:]:
+        print("SKIP the drafter step: this server loads no DFlash2 drafter", flush=True)
+        s.stop()
+    else:
+        # (a long system block, a short user turn: the prefix checkpoint sits at the end of the system block)
+        c7 = [{"role": "system", "content": "You are a coding agent. Repository notes:\n" + CORPUS_TEXT[:TOKENS * 4]},
+              {"role": "user", "content": "Summarize the notes in one sentence."}]
+        f7 = {"role": "user", "content": "Name one thing in them that could fail, in one sentence."}
+        a7, _, _, _ = chat(c7)
+        chat([{"role": "user", "content": "Say hello in five words."}], max_tokens=8)  # (a second conversation)
+        check(s.p.poll() is None, "with a drafter: the server runs after a long prompt")
+        s.stop()
+        check(s.p.returncode in (0, -signal.SIGTERM), "with a drafter: the save at stop does not crash", s.p.returncode)
+        s = Server(os.path.join(tmp, "home-dflash"), log)
+        _, w7, _, _ = chat(turn2(c7, a7, f7))
+        check(cached(w7) > TOKENS // 2, "with a drafter: the follow-up is cached after a restart", w7)
         s.stop()
 
 
